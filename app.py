@@ -10,17 +10,42 @@ def extract_invoice_data(file):
 
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            text += page.extract_text() or ""
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
 
     data = {}
 
-    inv_match = re.search(r"Invoice\s*No[:\-]?\s*(\S+)", text)
-    if inv_match:
-        data["invoice_no"] = inv_match.group(1)
+    # Try multiple patterns for invoice number
+    inv_patterns = [
+        r"Invoice\s*No[:\-]?\s*(\S+)",
+        r"Inv\s*No[:\-]?\s*(\S+)",
+        r"Invoice\s*Number[:\-]?\s*(\S+)"
+    ]
 
-    total_match = re.search(r"Total[:\-]?\s*([\d,\.]+)", text)
-    if total_match:
-        data["total"] = float(total_match.group(1).replace(",", ""))
+    for pattern in inv_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            data["invoice_no"] = match.group(1)
+            break
+
+    # Try multiple patterns for total value
+    total_patterns = [
+        r"Total\s*Amount[:\-]?\s*([\d,\.]+)",
+        r"Grand\s*Total[:\-]?\s*([\d,\.]+)",
+        r"Invoice\s*Value[:\-]?\s*([\d,\.]+)",
+        r"TOTAL\s+([\d,\.]+)",
+        r"Total[:\-]?\s*([\d,\.]+)"
+    ]
+
+    for pattern in total_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                data["total"] = float(match.group(1).replace(",", ""))
+                break
+            except:
+                pass
 
     return data
 
@@ -33,15 +58,17 @@ def extract_packing_data(file):
 
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            text += page.extract_text() or ""
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
 
     data = {}
 
-    gross = re.search(r"Gross\s*Weight[:\-]?\s*([\d\.]+)", text)
+    gross = re.search(r"Gross\s*Weight[:\-]?\s*([\d\.]+)", text, re.IGNORECASE)
     if gross:
         data["gross_weight"] = float(gross.group(1))
 
-    net = re.search(r"Net\s*Weight[:\-]?\s*([\d\.]+)", text)
+    net = re.search(r"Net\s*Weight[:\-]?\s*([\d\.]+)", text, re.IGNORECASE)
     if net:
         data["net_weight"] = float(net.group(1))
 
@@ -49,7 +76,7 @@ def extract_packing_data(file):
 
 
 # -----------------------------
-# Validate Data
+# Validation Logic
 # -----------------------------
 def validate(invoice, packing):
     errors = []
@@ -57,82 +84,6 @@ def validate(invoice, packing):
 
     # Invoice checks
     if not invoice.get("invoice_no"):
-        errors.append("Invoice Number Missing")
+        errors.append("❌ Invoice Number not detected")
 
     if not invoice.get("total"):
-        errors.append("Total Value Missing")
-
-    # Packing checks
-    if packing.get("net_weight") and packing.get("gross_weight"):
-        if packing["net_weight"] > packing["gross_weight"]:
-            errors.append("Net weight is greater than Gross weight ❌")
-
-    # Comparison
-    comparison.append({
-        "Field": "Invoice Number",
-        "Invoice": invoice.get("invoice_no", "N/A"),
-        "Status": "✅" if invoice.get("invoice_no") else "❌"
-    })
-
-    return errors, comparison
-
-
-# -----------------------------
-# Generate Report
-# -----------------------------
-def generate_report(errors, comparison):
-    report = "EXPORT VERIFICATION REPORT\n\n"
-
-    report += "ERRORS:\n"
-    if errors:
-        for e in errors:
-            report += f"- {e}\n"
-    else:
-        report += "No errors found ✅\n"
-
-    report += "\nCOMPARISON:\n"
-    for c in comparison:
-        report += f"{c['Field']} | {c['Invoice']} | {c['Status']}\n"
-
-    return report
-
-
-# -----------------------------
-# STREAMLIT UI
-# -----------------------------
-st.title("📦 Export Checklist Verifier")
-
-invoice_file = st.file_uploader("Upload Invoice PDF", type=["pdf"])
-packing_file = st.file_uploader("Upload Packing List PDF", type=["pdf"])
-checklist_file = st.file_uploader("Upload Checklist", type=["pdf", "xlsx"])
-
-if st.button("Verify Documents"):
-
-    if invoice_file and packing_file and checklist_file:
-
-        invoice_data = extract_invoice_data(invoice_file)
-        packing_data = extract_packing_data(packing_file)
-
-        errors, comparison = validate(invoice_data, packing_data)
-
-        st.subheader("🔴 Errors")
-        if errors:
-            for err in errors:
-                st.error(err)
-        else:
-            st.success("✅ No errors found")
-
-        st.subheader("📊 Comparison")
-        for row in comparison:
-            st.write(row)
-
-        report_text = generate_report(errors, comparison)
-
-        st.download_button(
-            label="📥 Download Report",
-            data=report_text,
-            file_name="report.txt"
-        )
-
-    else:
-        st.warning("⚠️ Please upload Invoice, Packing List and Checklist")
