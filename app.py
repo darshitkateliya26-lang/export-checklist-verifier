@@ -2,110 +2,126 @@ import streamlit as st
 import pdfplumber
 import re
 
-# Extract Invoice Data
-def extract_invoice_data(file):
+# -----------------------------
+# Extract text from PDF
+# -----------------------------
+def extract_text(file):
     text = ""
-
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
-                text += t
+                text += t + "\n"
+    return text
 
-    data = {}
 
-    # Invoice number
-    match = re.search(r"Invoice\s*No[:\-]?\s*(\S+)", text, re.IGNORECASE)
-    if match:
-        data["invoice_no"] = match.group(1)
-
-    # Total (multiple formats)
-    patterns = [
-        r"Total\s*Amount[:\-]?\s*([\d,\.]+)",
-        r"Grand\s*Total[:\-]?\s*([\d,\.]+)",
-        r"Invoice\s*Value[:\-]?\s*([\d,\.]+)",
-        r"TOTAL\s+([\d,\.]+)"
-    ]
-
+# -----------------------------
+# Generic Field Finder
+# -----------------------------
+def find_field(patterns, text):
     for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            try:
-                data["total"] = float(m.group(1).replace(",", ""))
-                break
-            except:
-                pass
-
-    return data
+        match = re.search(p, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
 
 
-# Extract Packing Data
-def extract_packing_data(file):
-    text = ""
-
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text += t
-
+# -----------------------------
+# Extract Invoice Data
+# -----------------------------
+def extract_invoice_data(text):
     data = {}
 
-    g = re.search(r"Gross\s*Weight[:\-]?\s*([\d\.]+)", text, re.IGNORECASE)
-    if g:
-        data["gross_weight"] = float(g.group(1))
+    data["invoice_no"] = find_field([
+        r"Invoice\s*No[:\-]?\s*(\S+)"
+    ], text)
 
-    n = re.search(r"Net\s*Weight[:\-]?\s*([\d\.]+)", text, re.IGNORECASE)
-    if n:
-        data["net_weight"] = float(n.group(1))
+    data["invoice_date"] = find_field([
+        r"Date[:\-]?\s*(\S+)"
+    ], text)
+
+    data["gstin"] = find_field([
+        r"GSTIN[:\-]?\s*(\S+)"
+    ], text)
+
+    data["iec"] = find_field([
+        r"IEC[:\-]?\s*(\S+)"
+    ], text)
+
+    data["country_origin"] = find_field([
+        r"Country\s*of\s*Origin[:\-]?\s*(.+)"
+    ], text)
+
+    data["total"] = find_field([
+        r"Total\s*Amount[:\-]?\s*([\d,\.]+)",
+        r"Grand\s*Total[:\-]?\s*([\d,\.]+)"
+    ], text)
 
     return data
 
 
-# Validation
+# -----------------------------
+# Extract Packing Data
+# -----------------------------
+def extract_packing_data(text):
+    data = {}
+
+    data["gross_weight"] = find_field([
+        r"Gross\s*Weight[:\-]?\s*([\d\.]+)"
+    ], text)
+
+    data["net_weight"] = find_field([
+        r"Net\s*Weight[:\-]?\s*([\d\.]+)"
+    ], text)
+
+    data["cartons"] = find_field([
+        r"Cartons[:\-]?\s*(\d+)"
+    ], text)
+
+    return data
+
+
+# -----------------------------
+# Validation Engine
+# -----------------------------
 def validate(invoice, packing):
-    errors = []
-    comparison = []
 
-    if not invoice.get("invoice_no"):
-        errors.append("❌ Invoice Number not found")
+    results = []
 
-    if not invoice.get("total"):
-        errors.append("⚠️ Total value not detected from invoice")
+    def check(field_name, value):
+        if value:
+            return {"Field": field_name, "Status": "✅ Matched", "Value": value}
+        else:
+            return {"Field": field_name, "Status": "⚠️ Missing", "Value": "Not Found"}
 
-    if packing.get("net_weight") and packing.get("gross_weight"):
-        if packing["net_weight"] > packing["gross_weight"]:
-            errors.append("❌ Net weight > Gross weight")
+    results.append(check("Invoice Number", invoice.get("invoice_no")))
+    results.append(check("Invoice Date", invoice.get("invoice_date")))
+    results.append(check("GSTIN", invoice.get("gstin")))
+    results.append(check("IEC", invoice.get("iec")))
+    results.append(check("Country of Origin", invoice.get("country_origin")))
+    results.append(check("Total Value", invoice.get("total")))
 
-    comparison.append({
-        "Field": "Invoice Number",
-        "Value": invoice.get("invoice_no", "Not Found")
-    })
+    results.append(check("Gross Weight", packing.get("gross_weight")))
+    results.append(check("Net Weight", packing.get("net_weight")))
+    results.append(check("Cartons", packing.get("cartons")))
 
-    comparison.append({
-        "Field": "Total Value",
-        "Value": invoice.get("total", "Not Found")
-    })
-
-    return errors, comparison
+    return results
 
 
-# Report
-def generate_report(errors, comparison):
-    txt = "EXPORT REPORT\n\n"
+# -----------------------------
+# Summary Generator
+# -----------------------------
+def generate_summary(results):
+    matched = sum(1 for r in results if "✅" in r["Status"])
+    missing = sum(1 for r in results if "⚠️" in r["Status"])
+    mismatch = sum(1 for r in results if "❌" in r["Status"])
 
-    txt += "Errors:\n"
-    for e in errors:
-        txt += f"- {e}\n"
-
-    txt += "\nData:\n"
-    for c in comparison:
-        txt += f"{c['Field']} : {c['Value']}\n"
-
-    return txt
+    return matched, missing, mismatch
 
 
+# -----------------------------
 # UI
+# -----------------------------
 st.title("📦 Export Checklist Verifier")
 
 invoice_file = st.file_uploader("Upload Invoice PDF", type=["pdf"])
@@ -116,16 +132,30 @@ if st.button("Verify Documents"):
 
     if invoice_file and packing_file and checklist_file:
 
-        invoice = extract_invoice_data(invoice_file)
-        packing = extract_packing_data(packing_file)
+        inv_text = extract_text(invoice_file)
+        pack_text = extract_text(packing_file)
 
-        errors, comparison = validate(invoice, packing)
+        invoice = extract_invoice_data(inv_text)
+        packing = extract_packing_data(pack_text)
 
-        st.subheader("Errors")
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            st.success("No errors")
+        results = validate(invoice, packing)
 
-        st.subheader("Data Extracted")
+        st.subheader("📊 Field Validation")
+
+        for r in results:
+            st.write(r)
+
+        matched, missing, mismatch = generate_summary(results)
+
+        st.subheader("📈 Summary")
+        st.success(f"✅ Matched: {matched}")
+        st.warning(f"⚠️ Missing: {missing}")
+        st.error(f"❌ Mismatch: {mismatch}")
+
+        # Critical warning
+        if missing > 0 or mismatch > 0:
+            st.error("🚨 Critical issues detected — fix before export clearance")
+
+    else:
+        st.warning("Upload all 3 documents")
+``
