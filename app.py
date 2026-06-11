@@ -66,7 +66,6 @@ def extract_fields(text):
     full = text
 
     def fr(patterns):
-        """Find first regex match across full text."""
         for pat in patterns:
             m = re.search(pat, full, re.IGNORECASE)
             if m:
@@ -75,50 +74,44 @@ def extract_fields(text):
                     return val
         return ""
 
-    def next_line_after(keyword_pat):
-        """Return stripped next line after line matching keyword."""
-        for i, line in enumerate(lines):
-            if re.search(keyword_pat, line, re.IGNORECASE):
-                if i + 1 < len(lines):
-                    return lines[i + 1].strip()
-        return ""
-
-    def same_or_next(keyword_pat, value_pat=None):
-        """Extract value same line (after colon) or next line."""
-        for i, line in enumerate(lines):
-            if re.search(keyword_pat, line, re.IGNORECASE):
-                if value_pat:
-                    m = re.search(value_pat, line, re.IGNORECASE)
-                    if m:
-                        return m.group(1).strip()
-                parts = re.split(r'[:\-]', line, maxsplit=1)
-                if len(parts) > 1:
-                    val = parts[-1].strip()
-                    if val and len(val) > 1 and val not in ("&", "-", "–"):
-                        return val
-                if i + 1 < len(lines):
-                    nxt = lines[i + 1].strip()
-                    if nxt and len(nxt) > 1:
-                        return nxt
-        return ""
-
     fields = {}
 
     # ── Exporter Name ──
-    # First line with company keyword, skip CHA/clearing agents
+    # Invoice/PL: "OMNI LENS PVT. LTD." appears early, skip CHA lines
+    # Checklist: appears after "EXPORTER DETAILS" block
     exporter = ""
-    for line in lines[:20]:
-        if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b', line, re.IGNORECASE):
-            if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b|CUSTOM)', line, re.IGNORECASE):
-                exporter = line.strip()
-                break
+    # Try after EXPORTER DETAILS label first (checklist)
+    for i, line in enumerate(lines):
+        if re.search(r'EXPORTER\s+DETAILS', line, re.IGNORECASE):
+            # IEC number is on same/next line, company name follows after
+            for j in range(i+1, min(i+6, len(lines))):
+                candidate = lines[j].strip()
+                if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b',
+                             candidate, re.IGNORECASE):
+                    if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b|CUSTOM|GSTIN|PAN\s)',
+                                     candidate, re.IGNORECASE):
+                        exporter = candidate
+                        break
+            break
+    # Fallback: first company-looking line in top 20
+    if not exporter:
+        for line in lines[:20]:
+            if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b',
+                         line, re.IGNORECASE):
+                if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b|CUSTOM|GSTIN|PAN\s)',
+                                 line, re.IGNORECASE):
+                    exporter = line.strip()
+                    break
     fields["Exporter Name"] = exporter
 
-    # ── IEC ── strict 10-digit
+    # ── IEC ──
+    # Invoice/PL: "IEC CODE : 0893006939"  on header line
+    # Checklist: "0893006939 GSTIN: ..." — IEC is first token after EXPORTER DETAILS
     fields["IEC"] = fr([
-        r"\bIEC\b[\s:\-#]*([0-9]{10})\b",
-        r"\bIEC\s*(?:CODE|No\.?)[\s:\-]*([0-9]{10})\b",
-        r"(?:IEC|I\.E\.C)[\s\S]{0,10}([0-9]{10})",
+        r"IEC\s*(?:CODE)?[\s:\-#]*([0-9]{10})\b",
+        r"\bIEC\b[\s\S]{0,10}([0-9]{10})\b",
+        # Checklist: standalone 10-digit number at start of line after EXPORTER DETAILS
+        r"(?:^|\n)\s*([0-9]{10})\s+GSTIN",
     ])
 
     # ── GSTIN ──
@@ -128,193 +121,288 @@ def extract_fields(text):
 
     # ── PAN ──
     fields["PAN"] = fr([
-        r"\bPAN\s*[:\-#]?\s*([A-Z]{5}[0-9]{4}[A-Z])\b",
+        r"PAN\s*(?:No\.?|:)?\s*([A-Z]{5}[0-9]{4}[A-Z])\b",
         r"\b([A-Z]{5}[0-9]{4}[A-Z])\b",
     ])
 
-    # ── AD Code ── 7-digit number near AD Code label
+    # ── AD Code ──
+    # Invoice/PL: "Bank AD Code :8656901"
+    # Checklist:  "Ad. Code 8656901"
     fields["AD Code"] = fr([
-        r"AD\s*\.?\s*Code[\s:\-]*([0-9]{7})\b",
-        r"\bA\.?D\.?\s*Code[\s\S]{0,20}?([0-9]{7})\b",
+        r"(?:Bank\s+)?AD\s*\.?\s*Code[\s:\-]*([0-9]{7})\b",
+        r"Ad\.\s*Code[\s:\-]*([0-9]{7})\b",
     ])
 
     # ── Invoice No ──
-    # Format seen: 0057/84/26-27  or  E/GST/043/26-27
-    # Must contain slash and numbers, NOT "& Date" or long sentences
+    # Seen: "E/GST/043/26-27" in invoice header and checklist
+    # Invoice header line: "Invoice No & Date IEC CODE : 0893006939 ... E/GST/043/26-27"
     fields["Invoice No"] = fr([
-        r"Invoice\s*(?:No|Number|#)[\s:.\-]*([A-Z0-9]{1,6}[/\-][A-Z0-9/\-]{3,20})",
-        r"Inv\.?\s*No\.?[\s:.\-]*([A-Z0-9]{1,6}[/\-][A-Z0-9/\-]{3,20})",
-        r"\b([0-9]{4}[/\-][0-9]{2,3}[/\-][0-9]{2,4})\b",
         r"\b(E/(?:GST|LUT)/[0-9]+/[0-9\-]+)\b",
+        r"Inv\.?\s*No\.?[\s:\-]*([A-Z0-9]{1,6}/[A-Z0-9/\-]{3,20})",
+        r"Invoice\s*No[\s:\-]*([A-Z0-9]{1,6}/[A-Z0-9/\-]{3,20})",
+        r"\b([0-9]{4}/[0-9]{2,3}/[0-9]{2,4})\b",
     ])
 
     # ── Invoice Date ──
+    # Seen: "09.06.2026"
     fields["Invoice Date"] = fr([
-        r"Invoice\s+(?:No\s*[&]\s*)?Date[\s:\-]*(\d{1,2}[./\-]\d{1,2}[./\-]\d{2,4})",
-        r"Date[\s:\-]*(\d{2}[./\-]\d{2}[./\-]\d{4})",
+        r"(?:Inv\.?\s*Date|Invoice\s+Date)[\s:\-]*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})",
         r"\b(\d{2}[./\-]\d{2}[./\-]\d{4})\b",
-        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4})\b",
+        r"\b(\d{1,2}[-\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\s]\d{4})\b",
     ])
 
     # ── Buyer / Consignee ──
-    # Look for actual company after Consignee label, skip template text
+    # Seen: "MD TECH srl" after Consignee label
     consignee = ""
     for i, line in enumerate(lines):
-        if re.search(r'\b(Consignee|Ship\s*To)\b', line, re.IGNORECASE):
-            for j in range(i+1, min(i+6, len(lines))):
+        if re.search(r'\bConsignee\b', line, re.IGNORECASE):
+            for j in range(i+1, min(i+5, len(lines))):
                 nxt = lines[j].strip()
                 if (nxt and len(nxt) > 3
                         and not re.search(r'\b(if other|consignee|buyer|name|address)\b', nxt, re.IGNORECASE)
-                        and not re.search(r'^[:\-\.]', nxt)):
+                        and not nxt.startswith((':', '-', '.'))):
                     consignee = nxt
                     break
             break
+    # Checklist: consignee is after "CONSIGNEE" header
+    if not consignee:
+        for i, line in enumerate(lines):
+            if re.search(r'^CONSIGNEE$', line, re.IGNORECASE):
+                if i + 1 < len(lines):
+                    consignee = lines[i+1].strip()
+                break
     fields["Buyer / Consignee"] = consignee
 
     # ── Buyer PO No ──
     fields["Buyer PO No"] = fr([
-        r"P\.?O\.?\s*(?:No|Number|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
-        r"Purchase\s+Order[\s:\-]*([A-Z0-9/\-]{3,25})",
-        r"Order\s*(?:No|Ref)[\s:\-]*([A-Z0-9/\-]{3,25})",
+        r"(?:Buyer'?s?\s+)?Order\s*(?:No\.?|Number|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
+        r"P\.?O\.?\s*(?:No|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
     ])
 
     # ── Country of Origin ──
-    # From invoice: "Country of origin of goods" then value on same line or next
-    # Seen value: INDIA
-    fields["Country of Origin"] = fr([
-        r"Country\s+of\s+(?:origin\s+of\s+goods|Origin)[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
-        r"Origin\s+of\s+[Gg]oods[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
-        r"Country\s+of\s+[Oo]rigin[\s\S]{0,5}([A-Z]{4,20})\b",
+    # Invoice/PL: "Country of origin of goods ... INDIA"
+    # The line is: "Country of origin of goods Country of final Destination"
+    # Then next line: "INDIA ITALY"
+    # So we need to find INDIA after this label
+    co_origin = fr([
+        r"Country\s+of\s+origin\s+of\s+goods[\s\S]{0,60}?(INDIA|[A-Z]{4,20})\s+(?:[A-Z]{4,20}|$)",
     ])
+    if not co_origin:
+        # Next line approach: find line with "Country of origin" then grab first word of next line
+        for i, line in enumerate(lines):
+            if re.search(r'Country\s+of\s+origin', line, re.IGNORECASE):
+                # value may be on same line after label or on next line
+                # Same line: after second occurrence splits
+                m = re.search(r'Country\s+of\s+origin[^\n]*?([A-Z]{4,20})\s*$', line, re.IGNORECASE)
+                if m:
+                    co_origin = m.group(1)
+                    break
+                if i + 1 < len(lines):
+                    # Next line: first word
+                    nxt = lines[i+1].strip()
+                    first_word = nxt.split()[0] if nxt.split() else ""
+                    if re.match(r'^[A-Z]{3,20}$', first_word):
+                        co_origin = first_word
+                        break
+    # Checklist direct
+    if not co_origin:
+        co_origin = fr([r"Country\s+of\s+[Oo]rigin[\s:\-]+([A-Z][A-Za-z]{2,20})\b"])
+    fields["Country of Origin"] = co_origin
 
     # ── Country of Destination ──
-    # Seen value: ITALY  — appears after "Country of final Dest"
-    fields["Country of Destination"] = fr([
-        r"Country\s+of\s+(?:final\s+)?[Dd]est(?:ination)?[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
-        r"Final\s+Destination[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
-        r"Destination\s+Country[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
+    # Invoice/PL: same line as origin "Country of final Destination" → ITALY (second word on next line)
+    # Checklist: "Country of Dest Italy" or "Discharge Country Italy"
+    co_dest = fr([
+        r"(?:Country\s+of\s+(?:final\s+)?[Dd]est(?:ination)?|Discharge\s+Country)[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
     ])
+    if not co_dest:
+        for i, line in enumerate(lines):
+            if re.search(r'Country\s+of\s+(?:final\s+)?Dest', line, re.IGNORECASE):
+                m = re.search(r'Country\s+of\s+(?:final\s+)?Dest[^\n]*?([A-Z]{4,20})\s*$', line, re.IGNORECASE)
+                if m:
+                    co_dest = m.group(1)
+                    break
+                if i + 1 < len(lines):
+                    nxt = lines[i+1].strip().split()
+                    # second word on next line (first = origin country)
+                    if len(nxt) >= 2 and re.match(r'^[A-Z]{3,20}$', nxt[1]):
+                        co_dest = nxt[1]
+                        break
+                    elif len(nxt) >= 1 and re.match(r'^[A-Z]{3,20}$', nxt[0]):
+                        co_dest = nxt[0]
+                        break
+    fields["Country of Destination"] = co_dest
 
     # ── Port of Loading ──
-    # Seen value: AHMEDABAD INDIA  — appears after "Place of Loading" or "Port of Loading"
+    # Invoice/PL: "Port of Loading\nAHMEDABAD-INDIA"  or  "Port of Loading AHMEDABAD-INDIA"
+    # Checklist:  "Port Of Loading Ahmedabad Air Cargo(INAMD4)"
     fields["Port of Loading"] = fr([
-        r"(?:Port|Place)\s+of\s+Loading[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|Port|Discharge|Final|Country|$))",
-        r"Loading\s+Port[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|$))",
-        r"\bPOL[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|POD|$))",
-        r"Port\s+of\s+Loading[\s\S]{0,5}([A-Z][A-Za-z ]{3,25})",
+        r"Port\s+[Oo]f\s+Loading[\s:\-]+([A-Za-z][A-Za-z0-9 \-()]{3,40}?)(?=\s*(?:\n|Port|Nature|Country|$))",
+        r"Port\s+[Oo]f\s+Loading[\s\n:\-]+([A-Za-z][A-Za-z0-9 \-]{3,30})",
     ])
 
     # ── Port of Discharge ──
-    # Seen value: MILAN  or  ITALY
+    # Invoice/PL: "Port of Discharge\nMILAN" then "Final Destination\nMILAN ITALY"
+    # Checklist:  "Port Of Discharge Milano(ITMIL)"
     fields["Port of Discharge"] = fr([
-        r"(?:Port|Place)\s+of\s+Discharge[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|Port|Country|$))",
-        r"Final\s+(?:Port|Destination)[\s:\-]+([A-Z][A-Za-z ]{2,25}?)(?=\s*(?:\n|$))",
-        r"Discharge\s+Port[\s:\-]+([A-Z][A-Za-z ]{2,25}?)(?=\s*(?:\n|$))",
-        r"\bPOD[\s:\-]+([A-Z][A-Za-z ]{2,25}?)(?=\s*(?:\n|$))",
+        r"Port\s+[Oo]f\s+Discharge[\s:\-]+([A-Za-z][A-Za-z0-9 \-()]{2,30}?)(?=\s*(?:\n|Port|Final|Country|$))",
+        r"Port\s+[Oo]f\s+Discharge[\s\n:\-]+([A-Za-z][A-Za-z0-9 \-]{2,25})",
     ])
 
-    # ── Incoterm ── strict codes only
+    # ── Incoterm ──
     fields["Delivery Terms (Incoterm)"] = fr([
         r"\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b",
     ])
 
     # ── Payment Terms ──
+    # Seen: "Payment within 180 days from the date of shipment"
+    # Checklist: "Nature Of Payment DA  Period Of Payment 180 days"
     fields["Payment Terms"] = fr([
-        r"Payment\s+(?:within|Terms?)[\s:\-]+([A-Za-z0-9 ,/\-]{3,40}?)(?=\s*(?:\n|days|$))",
-        r"\b(DA\s*\d*\s*[Dd]ays?|DP\s*\d*\s*[Dd]ays?|Advance|T/?T|L/?C|Sight)\b",
+        r"Nature\s+Of\s+Payment[\s:\-]+([A-Za-z]{2,10})",
+        r"Payment\s+within[\s:\-]+([0-9]+\s*days?[^,\n]{0,30})",
+        r"\b(DA\s+\d+\s*[Dd]ays?|DP\s+\d+\s*[Dd]ays?|Advance|T/?T|L/?C)\b",
         r"\b(DA|DP|TT|LC|Advance)\b",
     ])
 
     # ── Mode of Transport ──
     fields["Mode of Transport"] = fr([
-        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]+([A-Za-z]{3,20})",
+        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]+([A-Za-z]{3,15})",
         r"\b(Sea|Air|Road|Rail|Multimodal)\b",
+        r"CIF\s+BY\s+\(([A-Za-z]+)\)",
     ])
 
     # ── Marks & Nos ──
+    # Seen: "Crtn.SR.no 01 to 01 Total Cartons : 01"
+    # Checklist: "WE INTEND TO CLAIM REWARDS RODTEP"
     fields["Marks & Nos"] = fr([
-        r"Marks?\s*(?:&|and)\s*Nos?[\s:\-]+([^\n]{3,50})",
-        r"Container\s*No[\s:\-]+([^\n]{3,40})",
+        r"Marks?\s*(?:&|and)\s*[Nn]o[s.]?[\s:\-]+([^\n]{3,60})",
+        r"(Crtn\.SR\.no[^\n]{3,40})",
+        r"(WE\s+INTEND\s+TO[^\n]{5,50})",
     ])
 
     # ── Currency ──
-    # Prioritise EUR/USD over INR
+    # Invoice: "EURO" and "EUR"
     foreign = fr([r"\b(EUR|USD|GBP|AED|JPY|CNY|SGD|CAD|AUD)\b"])
     fields["Currency"] = foreign if foreign else fr([r"\b(INR)\b"])
 
     # ── Total Invoice Value ──
-    # Seen in invoice: "Total Tax Value (Rs.) 8292.08"  and EUR total
-    # Seen in checklist: "Inv.Value USD3550.00" or "693956.00"
+    # Invoice: "Total Tax Value (Rs.) 34697.80"  ← this is IGST only, NOT total
+    # Real total: "6352.00" (EUR) or "EURO SIX THOUSAND..." → 6352.00
+    # Checklist: "Inv. Value EUR 6352.00 (INR 693956.00)"
     fields["Total Invoice Value"] = fr([
-        r"Total\s+(?:Invoice\s+)?(?:Tax\s+)?Value[\s:\(RsINR\):\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"(?:Grand\s+)?Total\s+(?:Amount|Value)[\s:\-]*(?:EUR|USD|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
         r"Inv\.?\s*Value\s+(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
-        r"(?:EUR|USD|GBP|INR)\s*([0-9]{3,}\.?[0-9]{0,2})\s*(?:\(|$|\n)",
-        r"Amount\s+(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
+        r"(?:Invoice|Inv\.?)\s*(?:Value|Amount)[\s:\-]*(?:EUR|USD|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
+        r"Amount\s+Chargeable[^\n]*\n[^\n]*?([0-9,]{3,}\.?[0-9]{0,2})\s*$",
+        # Last number on the "Amount Chargeable" line
+        r"(?:EUR|USD|GBP)\s+(?:[A-Z ]+\s+)?([0-9,]+\.?[0-9]{0,2})\s*$",
+        r"(?:IGST\s+Taxable\s+Value|Inv\.?\s*Value)[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
     ])
 
     # ── FOB Value ──
+    # Invoice: "Before Tax Value (Rs.) 693956.00"  ← INR FOB
+    # Checklist: "FOB Value EUR 6337.00 (INR 692317.25)" or "Total FOB (INR) 692317.25"
     fields["FOB Value"] = fr([
-        r"(?:Before\s+Tax\s+Value|FOB\s+(?:Value|Amount|Price))[\s:\(Rs\.\)]*([0-9,]+\.?[0-9]{0,2})",
+        r"FOB\s+Value\s+(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
+        r"Total\s+FOB\s*\([A-Z]+\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
+        r"FOB\s+Val(?:ue)?\s*\([A-Z]+\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
+        r"Before\s+Tax\s+Value\s*\([A-Z]+\.?\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
         r"FOB[\s:\-]+(?:EUR|USD|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
     ])
 
     # ── Gross Weight ──
+    # PL: "6.00"  Checklist: "Gross Weight 6.000 KGS"
     fields["Gross Weight"] = fr([
-        r"Gross\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
+        r"Gross\s+(?:Weight|Wt\.?|wt)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
         r"G\.?\s*W(?:eight|t)?\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-        r"Gross\s+wt[\s:\-]*([0-9,]+\.?[0-9]{0,3})",
+        # PL table: "465 4.50 6.00" — gross is last number in totals row
+        r"Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})",
     ])
+    # For PL: gross weight is 3rd number in "Total 465 4.50 6.00"
+    if not fields["Gross Weight"]:
+        m = re.search(r'Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})', full)
+        if m:
+            fields["Gross Weight"] = m.group(2)  # last = gross
 
     # ── Net Weight ──
     fields["Net Weight"] = fr([
-        r"Net\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
+        r"Net\s+(?:Weight|Wt\.?|wt)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
         r"N\.?\s*W(?:eight|t)?\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-        r"Net\s+wt[\s:\-]*([0-9,]+\.?[0-9]{0,3})",
     ])
+    # For PL: net weight is 2nd number in "Total 465 4.50 6.00"
+    if not fields["Net Weight"]:
+        m = re.search(r'Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})', full)
+        if m:
+            fields["Net Weight"] = m.group(1)  # first = net
 
     # ── No. of Packages ──
+    # Invoice/PL: "Total Cartons : 01"
+    # Checklist: "Total Packages 1 CTN"
     fields["No. of Packages"] = fr([
-        r"(?:Total\s+)?(?:No\.?\s+of\s+)?(?:Packages?|Cartons?|Boxes|Cases|Pkgs?)[\s:\-]*([0-9]+)\b",
-        r"(?:Packing|Total)\s+Cartons?[\s:\-]*([0-9]+)\b",
+        r"Total\s+(?:Cartons?|Packages?|Pkgs?)[\s:\-]*([0-9]+)\b",
+        r"(?:No\.?\s+of\s+)?(?:Cartons?|Packages?|Boxes|Cases)[\s:\-]*([0-9]+)\b",
+        r"([0-9]+)\s+CTN\b",
     ])
 
     # ── LUT / Bond ──
+    # Invoice has: "E/GST/043/26-27" (same as invoice no for GST export)
+    # Checklist: LUT info in marks: "LUTNO.AD2403260563860DT:28.03.2026"
     fields["LUT / Bond"] = fr([
         r"\b(E/LUT/[0-9]+/[0-9\-]+)\b",
-        r"LUT\s*(?:No\.?|Number|#)?[\s:\-]*([A-Z0-9/\-]{4,30})",
-        r"Letter\s+of\s+Undertaking[\s:\-]*([A-Z0-9/\-]{4,30})",
+        r"LUT\s*(?:No\.?|NUMBER)?[\s:\-]*([A-Z0-9/\-]{4,30})",
+        r"LUTNO\.([A-Z0-9]+)",
     ])
 
     # ── DBK ──
+    # Seen: "DBK Sr. no. 9021/B" and "Shipment Under Duty Drawback No. 9021/B"
     fields["DBK / Drawback"] = fr([
-        r"(?:DBK|Drawback)\s*(?:Scheme|No\.?)?[\s:\-]*([A-Za-z0-9 /\-]{2,25})",
+        r"Duty\s+Drawback\s+No\.?[\s:\-]*([A-Z0-9/\-]{2,20})",
+        r"DBK\s+(?:Sr\.?\s*[Nn]o\.?|Declaration|Sl\s*No)[\s:\-]*([A-Z0-9/\-]{2,20})",
+        r"(?:DBK|Drawback)[\s:\-]+([A-Z0-9/\-]{2,15})",
+        r"9021/?[A-Z]\b",
     ])
+    if not fields["DBK / Drawback"]:
+        m = re.search(r'\b(9021/?[A-Z])\b', full)
+        if m:
+            fields["DBK / Drawback"] = m.group(1)
 
     # ── RoDTEP ──
+    # Checklist: "RODTEP Amount(INR) 2704.74"
     fields["RoDTEP"] = fr([
-        r"RoDTEP[\s:\-]*([A-Za-z0-9 .%/\-]{2,20})",
+        r"RODTEP\s+Amount[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
+        r"RoDTEP[\s:\-]*(?:Amount)?[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
     ])
 
     # ── IGST ──
+    # Checklist: "IGST Amount(INR) 34697.80"
     fields["IGST Refund"] = fr([
-        r"IGST[\s:\-]*(?:Rs\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
+        r"IGST\s+Amount[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
+        r"IGST[\s(INR):\-]+([0-9,]+\.?[0-9]{0,2})",
+        r"Add\s*:\s*IGST\s*\([A-Z]+\.?\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
     ])
 
-    # ── HSN Code ── 8-digit preferred, then 4-digit
+    # ── HSN Code ──
+    # Invoice: "H.S.CODE : 9021 3900"  (with space in middle)
+    # Checklist: "90213900" (RITC column)
     fields["HSN Code"] = fr([
-        r"H\.?S\.?N\.?\s*(?:Code|No\.?)?[\s:\-]*([0-9]{8})\b",
-        r"H\.?S\.?\s*Code[\s:\-]*([0-9]{6,8})\b",
-        r"HSN[\s:\-]*([0-9]{4,8})\b",
-        r"\b(9021[0-9]{4})\b",   # Optics/lens HSN family
+        r"H\.?S\.?(?:N\.?)?\s*CODE[\s:\-]*([0-9]{4}\s*[0-9]{4})",
+        r"H\.?S\.?(?:N\.?)?\s*CODE[\s:\-]*([0-9]{4,8})",
+        r"\bRITC\b[\s\S]{0,30}?([0-9]{8})\b",
+        r"\b(9021\s*3900)\b",
+        r"\b(90213900)\b",
     ])
+    # Clean space from HSN like "9021 3900" → "90213900"
+    if fields["HSN Code"]:
+        fields["HSN Code"] = fields["HSN Code"].replace(" ", "")
 
     # ── Bank A/C No ──
+    # Invoice/PL: "A/C - 01020107664"
+    # Checklist: "Forex Bank A/c No" followed by number, or "BankA/cNo 0036683667"
     fields["Bank A/C No"] = fr([
-        r"(?:Bank\s*A/?C\s*(?:No\.?)|Account\s*(?:No|Number)\.?)[\s:\-]*([0-9]{9,18})\b",
-        r"A/?C\s*No\.?[\s:\-]*([0-9]{9,18})\b",
+        r"A/C\s*[-–]\s*([0-9]{9,18})\b",
+        r"(?:Bank\s*)?A/?[Cc]\s*(?:No\.?|Number)?[\s:\-]+([0-9]{9,18})\b",
         r"BankA/cNo\s*([0-9]{9,18})\b",
-        r"(?:SB|CA|CC|OD)\s*(?:A/?C)?[\s:\-]*([0-9]{9,18})\b",
+        r"Forex\s+Bank\s+A/c\s+No[\s\S]{0,20}?([0-9]{9,18})\b",
+        r"Account\s*(?:No\.?|Number)[\s:\-]*([0-9]{9,18})\b",
     ])
 
     return {k: v.strip() if v else "" for k, v in fields.items()}
@@ -328,7 +416,7 @@ CRITICAL_FIELDS = {
 }
 
 def normalise(val):
-    return re.sub(r"[\s,./\-]", "", val).upper()
+    return re.sub(r"[\s,./\-()]", "", val).upper()
 
 def compare(inv_val, pack_val, chk_val):
     vals = [normalise(v) for v in (inv_val, pack_val, chk_val) if v]
@@ -475,7 +563,7 @@ with st.expander("🔍 View extracted raw text (debug)"):
     for tab, txt in zip(tabs, [inv_text, pack_text, chk_text]):
         with tab:
             if txt:
-                st.markdown(f'<div class="raw-text">{txt[:4000]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="raw-text">{txt[:5000]}</div>', unsafe_allow_html=True)
             else:
                 st.caption("No document uploaded.")
 
