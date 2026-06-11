@@ -1,32 +1,47 @@
-import pdfplumber
+def validate(invoice, packing, checklist):
 
-def validate(invoice, packing):
-    errors = []
-    comparison = []
+    results = []
 
-    # Invoice check
-    if not invoice.get("invoice_no"):
-        errors.append({
-            "field": "Invoice No",
-            "issue": "Missing",
-            "source": "Invoice"
-        })
+    def compare(field, inv, pack, chk):
 
-    # Total check
-    if not invoice.get("total"):
-        errors.append({
-            "field": "Total",
-            "issue": "Missing",
-            "source": "Invoice"
-        })
+        if inv == pack == chk and inv is not None:
+            status = "✅"
+        elif inv or pack or chk:
+            status = "⚠️"
+        else:
+            status = "❌"
 
-    # Add comparison row
-    comparison.append({
-        "field": "Invoice Number",
-        "invoice": invoice.get("invoice_no", "N/A"),
-        "packing": "N/A",
-        "status": "✅" if invoice.get("invoice_no") else "❌"
-    })
+        return {
+            "Field": field,
+            "Invoice": inv if inv else "-",
+            "Packing": pack if pack else "-",
+            "Checklist": chk if chk else "-",
+            "Status": status
+        }
 
-    return errors, comparison
+    results.append(compare("Invoice Number",
+                           invoice.get("invoice_no"),
+                           packing.get("invoice_no"),
+                           checklist.get("invoice_no")))
 
+    results.append(compare("GSTIN",
+                           invoice.get("gstin"),
+                           packing.get("gstin"),
+                           checklist.get("gstin")))
+
+    results.append(compare("IEC",
+                           invoice.get("iec"),
+                           packing.get("iec"),
+                           checklist.get("iec")))
+
+    results.append(compare("Total Value",
+                           invoice.get("total"),
+                           packing.get("total"),
+                           checklist.get("total")))
+
+    results.append(compare("Gross Weight",
+                           None,
+                           packing.get("gross_weight"),
+                           checklist.get("gross_weight")))
+
+    return results
