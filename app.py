@@ -79,20 +79,6 @@ def extract_fields(text):
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     full = text
 
-    def line_after(keyword_patterns):
-        for i, line in enumerate(lines):
-            for pat in keyword_patterns:
-                m = re.search(pat, line, re.IGNORECASE)
-                if m:
-                    after = line[m.end():].strip().lstrip(":-").strip()
-                    if after and len(after) > 1 and after not in ("&", "-", ""):
-                        return after
-                    if i + 1 < len(lines):
-                        nxt = lines[i + 1].strip()
-                        if nxt and len(nxt) > 1:
-                            return nxt
-        return ""
-
     def find_regex(patterns):
         for pat in patterns:
             m = re.search(pat, full, re.IGNORECASE)
@@ -102,181 +88,248 @@ def extract_fields(text):
                     return val
         return ""
 
+    def value_on_next_line(keyword_pat):
+        """Return the line immediately after the line matching keyword_pat."""
+        for i, line in enumerate(lines):
+            if re.search(keyword_pat, line, re.IGNORECASE):
+                if i + 1 < len(lines):
+                    return lines[i + 1].strip()
+        return ""
+
+    def value_after_label(keyword_pat, same_line_pat=None):
+        """
+        Find keyword, then extract value:
+        - same line after colon/dash  OR
+        - next line if same line has no useful value
+        """
+        for i, line in enumerate(lines):
+            if re.search(keyword_pat, line, re.IGNORECASE):
+                # Try same-line extraction
+                if same_line_pat:
+                    m = re.search(same_line_pat, line, re.IGNORECASE)
+                    if m:
+                        return m.group(1).strip()
+                after = re.split(r'[:\-]', line, maxsplit=1)
+                if len(after) > 1:
+                    val = after[-1].strip()
+                    if val and len(val) > 1 and val not in ("&", "-"):
+                        return val
+                # Try next line
+                if i + 1 < len(lines):
+                    nxt = lines[i + 1].strip()
+                    if nxt and len(nxt) > 1:
+                        return nxt
+        return ""
+
     fields = {}
 
-    # Exporter Name
-    for line in lines[:15]:
+    # ── Exporter Name ──
+    # Invoice/PL: first line with company keyword
+    # Checklist: look for "Exporter" label, skip CHA name which appears elsewhere
+    exporter = ""
+    for line in lines[:20]:
         if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b', line, re.IGNORECASE):
-            fields["Exporter Name"] = line
-            break
-    else:
-        fields["Exporter Name"] = ""
+            # Skip lines that look like CHA/agent references
+            if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b)', line, re.IGNORECASE):
+                exporter = line
+                break
+    # Fallback: look for "Exporter" label explicitly
+    if not exporter:
+        exporter = value_after_label(r'\bExporter\b')
+    fields["Exporter Name"] = exporter
 
-    # IEC
+    # ── IEC ──
+    # In checklist: appears right below "EXPORTER DETAILS" or near IEC label
+    # Strict 10-digit numeric (most Indian IECs are numeric)
     fields["IEC"] = find_regex([
-        r"\bIEC\b[\s:\-#]*([A-Z0-9]{10})\b",
-        r"\bIEC\s*CODE\b[\s:\-]*([A-Z0-9]{10})\b",
+        r"\bIEC\b[\s:\-#]*([0-9]{10})\b",
+        r"\bIEC\s*CODE\b[\s:\-]*([0-9]{10})\b",
+        r"(?:EXPORTER\s*DETAILS?|IEC)[\s\S]{0,80}?([0-9]{10})",
     ])
 
-    # GSTIN
+    # ── GSTIN ──
     fields["GSTIN"] = find_regex([
         r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b",
     ])
 
-    # PAN
+    # ── PAN ──
     fields["PAN"] = find_regex([
         r"\b([A-Z]{5}[0-9]{4}[A-Z])\b",
     ])
 
-    # AD Code
+    # ── AD Code ──
+    # Format: 7-digit number, appears near "AD Code" label
     fields["AD Code"] = find_regex([
-        r"AD\s*Code[\s:\-]*([0-9]{7,14})",
+        r"AD\s*Code[\s:\-]*([0-9]{7})\b",
+        r"\bA\.?D\.?\s*Code[\s:\-]*([0-9]{7})\b",
+        # In checklist it may appear as standalone 7-digit after label
+        r"(?:AD\s*Code|Customs\s*Code)[\s\S]{0,30}?([0-9]{7})\b",
     ])
 
-    # Invoice No
-    fields["Invoice No"] = line_after([
-        r"Invoice\s*(No|Number|#)",
-        r"Inv\.?\s*No\.?",
+    # ── Invoice No ──
+    # Real invoice numbers look like: INV/2024/001, EXP-001, etc.
+    # NOT "& Date", NOT "E/LUT/...", NOT long sentences
+    fields["Invoice No"] = find_regex([
+        r"Invoice\s*(?:No|Number|#)[\s:\-]*([A-Z]{2,5}[/\-][A-Z0-9/\-]{3,20})",
+        r"Invoice\s*(?:No|Number|#)[\s:\-]*([0-9]{3,}[/\-][0-9A-Z/\-]{2,15})",
+        r"\bInv\.?\s*No\.?[\s:\-]*([A-Z0-9][A-Z0-9/\-]{3,20})",
     ])
-    if not fields["Invoice No"]:
-        fields["Invoice No"] = find_regex([
-            r"Invoice\s*(?:No|Number|#)[\s:\-]*([A-Z0-9][A-Z0-9/\-]{2,20})",
-        ])
 
-    # Invoice Date
+    # ── Invoice Date ──
     fields["Invoice Date"] = find_regex([
-        r"(?:Invoice\s+)?Date[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        r"Invoice\s+Date[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
         r"Dated?[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
         r"\b(\d{2}[\/\-]\d{2}[\/\-]\d{4})\b",
+        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4})\b",
     ])
 
-    # Buyer / Consignee
-    fields["Buyer / Consignee"] = line_after([
-        r"^Consignee",
-        r"^Buyer[\s:$]",
-        r"Bill\s+To",
-    ])
+    # ── Buyer / Consignee ──
+    # Look for actual company name after Consignee label
+    consignee = ""
+    for i, line in enumerate(lines):
+        if re.search(r'\b(Consignee|Ship\s*To)\b', line, re.IGNORECASE):
+            # Get value from next non-empty line that looks like a company
+            for j in range(i+1, min(i+5, len(lines))):
+                nxt = lines[j].strip()
+                if nxt and not re.search(r'\b(if other|consignee|buyer)\b', nxt, re.IGNORECASE):
+                    consignee = nxt
+                    break
+            break
+    fields["Buyer / Consignee"] = consignee
 
-    # Buyer PO No
+    # ── Buyer PO No ──
     fields["Buyer PO No"] = find_regex([
         r"P\.?O\.?\s*(?:No|Number|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
         r"Purchase\s+Order[\s:\-]*([A-Z0-9/\-]{3,25})",
     ])
 
-    # Country of Origin
+    # ── Country of Origin ──
+    # Must be an actual country name (2-20 alpha chars), not a sentence
     fields["Country of Origin"] = find_regex([
-        r"Country\s+of\s+Origin[\s:\-]*([A-Z][a-zA-Z ]{2,25}?)(?:\s+Country|\s+of|\n|$)",
-        r"Origin\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
+        r"Country\s+of\s+Origin[\s:\-]+([A-Z][a-zA-Z]{2,20})\b",
+        r"Origin\s+of\s+Goods[\s:\-]+([A-Z][a-zA-Z]{2,20})\b",
     ])
 
-    # Country of Destination
+    # ── Country of Destination ──
     fields["Country of Destination"] = find_regex([
-        r"Country\s+of\s+(?:Final\s+)?Destination[\s:\-]*([A-Z][a-zA-Z ]{2,25}?)(?:\s+Country|\n|$)",
-        r"Final\s+Destination\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
-        r"Destination\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
+        r"Country\s+of\s+(?:Final\s+)?Destination[\s:\-]+([A-Z][a-zA-Z]{2,20})\b",
+        r"Final\s+Destination[\s:\-]+([A-Z][a-zA-Z]{2,20})\b",
+        r"Destination\s+Country[\s:\-]+([A-Z][a-zA-Z]{2,20})\b",
     ])
 
-    # Port of Loading
+    # ── Port of Loading ──
+    # Must be a port/airport name — stop before next field keyword
     fields["Port of Loading"] = find_regex([
-        r"Port\s+of\s+Loading[\s:\-]*([A-Z][a-zA-Z() ]{3,35}?)(?:\s+Port|\s+of|\n|$)",
-        r"Loading\s+Port[\s:\-]*([A-Z][a-zA-Z() ]{3,35})",
-        r"\bPOL[\s:\-]+([A-Z][a-zA-Z() ]{3,35})",
+        r"Port\s+of\s+Loading[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:Port|Country|Discharge|$|\n))",
+        r"Loading\s+Port[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|Port|$))",
+        r"\bPOL[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|POD|$))",
     ])
 
-    # Port of Discharge
+    # ── Port of Discharge ──
     fields["Port of Discharge"] = find_regex([
-        r"Port\s+of\s+Discharge[\s:\-]*([A-Z][a-zA-Z() ]{3,35}?)(?:\s+Port|\s+of|\n|$)",
-        r"Discharge\s+Port[\s:\-]*([A-Z][a-zA-Z() ]{3,35})",
-        r"\bPOD[\s:\-]+([A-Z][a-zA-Z() ]{3,35})",
+        r"Port\s+of\s+Discharge[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|Port|Country|$))",
+        r"Discharge\s+Port[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|$))",
+        r"\bPOD[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|POL|$))",
+        r"Final\s+Port[\s:\-]+([A-Z][A-Za-z ]{2,30}?)(?=\s*(?:\n|$))",
     ])
 
-    # Incoterm
+    # ── Incoterm ──
     fields["Delivery Terms (Incoterm)"] = find_regex([
         r"\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b",
     ])
 
-    # Payment Terms
+    # ── Payment Terms ──
+    # DA, DP, TT, LC etc — get the actual term not a sentence
     fields["Payment Terms"] = find_regex([
-        r"Payment\s+Terms?[\s:\-]*([A-Za-z0-9 ,/\-]{4,50}?)(?:\n|$)",
-        r"\b(T/?T|L/?C|DP|DA|CAD|Advance|Sight\s+L/?C|Usance)[^\n]{0,30}",
+        r"Payment\s+Terms?[\s:\-]+([A-Za-z/]{2,30}?)(?=\s*(?:\n|Days|$))",
+        r"\b(DA\s+\d+\s*Days?|DP\s+\d+\s*Days?|T/?T|L/?C\s+at\s+\w+|Advance)\b",
+        r"\b(DA|DP|TT|LC)\b",
     ])
 
-    # Mode of Transport
+    # ── Mode of Transport ──
     fields["Mode of Transport"] = find_regex([
-        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]*([A-Za-z ]{3,20})",
+        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]+([A-Za-z]{3,20})",
         r"\b(Sea|Air|Road|Rail|Multimodal)\b",
     ])
 
-    # Marks & Nos
+    # ── Marks & Nos ──
     fields["Marks & Nos"] = find_regex([
-        r"Marks?\s*(?:&|and)\s*Nos?[\s:\-]*([^\n]{3,50})",
+        r"Marks?\s*(?:&|and)\s*Nos?[\s:\-]+([^\n]{3,50})",
     ])
 
-    # Currency
-    fields["Currency"] = find_regex([
-        r"\b(USD|EUR|GBP|INR|AED|JPY|CNY|SGD|CAD|AUD)\b",
-    ])
+    # ── Currency ──
+    # USD appears in invoice, INR in checklist — grab first occurrence
+    # But prioritise foreign currency (USD/EUR etc) over INR
+    foreign = find_regex([r"\b(USD|EUR|GBP|AED|JPY|CNY|SGD|CAD|AUD)\b"])
+    fields["Currency"] = foreign if foreign else find_regex([r"\b(INR)\b"])
 
-    # Total Invoice Value
+    # ── Total Invoice Value ──
+    # Pattern: "USD 3550.00" or "INR 3,36,895.00" or after "Total Value"
     fields["Total Invoice Value"] = find_regex([
-        r"(?:Total\s+Invoice\s+Value|Grand\s+Total|Invoice\s+Total|Amount\s+Due)[\s:\-]*(?:[A-Z]{0,3}\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
-        r"Total[\s:\-]*(?:USD|EUR|GBP|INR|AED)?\s*([0-9,]{4,}\.?[0-9]{0,2})",
+        r"(?:Total\s+Invoice\s+Value|Invoice\s+Value|Grand\s+Total|Total\s+Amount)[\s:\-]*(?:USD|EUR|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
+        r"(?:USD|EUR|GBP|INR|AED)\s*([0-9,]{3,}\.?[0-9]{0,2})\s*(?:\(|$|\n)",
+        r"Inv\.?\s*Value\s+(?:USD|EUR|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
     ])
 
-    # FOB Value
+    # ── FOB Value ──
     fields["FOB Value"] = find_regex([
-        r"FOB\s+(?:Value|Amount|Price)[\s:\-]*(?:[A-Z]{0,3}\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
+        r"FOB\s+(?:Value|Amount|Price)[\s:\-]*(?:USD|EUR|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
+        r"FOB[\s:\-]+(?:USD|EUR|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
     ])
 
-    # Gross Weight
+    # ── Gross Weight ──
     fields["Gross Weight"] = find_regex([
-        r"Gross\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-        r"G\.?W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+        r"Gross\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
+        r"G\.?\s*W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
+        r"(?:KGS?|KG)\s*(?:Gross[\s:\-]*)?([0-9,]+\.?[0-9]{0,3})",
     ])
 
-    # Net Weight
+    # ── Net Weight ──
     fields["Net Weight"] = find_regex([
-        r"Net\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-        r"N\.?W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+        r"Net\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
+        r"N\.?\s*W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
     ])
 
-    # No. of Packages
+    # ── No. of Packages ──
     fields["No. of Packages"] = find_regex([
         r"(?:No\.?\s+of\s+)?(?:Packages?|Cartons?|Boxes|Cases)[\s:\-]*([0-9]+)",
         r"Total\s+(?:Cartons?|Packages?)[\s:\-]*([0-9]+)",
     ])
 
-    # LUT
+    # ── LUT ──
     fields["LUT / Bond"] = find_regex([
         r"LUT\s*(?:No\.?|Number|#)?[\s:\-]*([A-Z0-9/\-]{4,30})",
         r"Letter\s+of\s+Undertaking[\s:\-]*([A-Z0-9/\-]{4,30})",
+        r"\b(E/LUT/[0-9/\-]+)\b",
     ])
 
-    # DBK
+    # ── DBK ──
     fields["DBK / Drawback"] = find_regex([
-        r"(?:DBK|Drawback)[\s:\-]*([A-Za-z0-9 /\-]{2,25})",
+        r"(?:DBK|Drawback)\s*(?:Scheme|No\.?)?[\s:\-]*([A-Za-z0-9 /\-]{2,25})",
     ])
 
-    # RoDTEP
+    # ── RoDTEP ──
     fields["RoDTEP"] = find_regex([
         r"RoDTEP[\s:\-]*([A-Za-z0-9 .%/\-]{2,20})",
     ])
 
-    # IGST
+    # ── IGST ──
     fields["IGST Refund"] = find_regex([
         r"IGST[\s:\-]*(?:Rs\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
     ])
 
-    # HSN Code
+    # ── HSN Code ──
     fields["HSN Code"] = find_regex([
         r"HSN\s*(?:Code|No\.?)?[\s:\-]*([0-9]{4,8})\b",
         r"HS\s+Code[\s:\-]*([0-9]{4,8})\b",
+        r"\b([0-9]{8})\b",  # 8-digit standalone number likely HSN
     ])
 
-    # Bank Name
-    fields["Bank Name"] = find_regex([
-        r"(?:Banker|Bank\s+Name|Through\s+Bank|Remittance\s+Bank)[\s:\-]*([A-Za-z ]{3,50}(?:Bank|BANK))",
-        r"([A-Z][A-Za-z ]{3,40}(?:BANK|Bank\s+(?:Ltd|Limited)))",
+    # ── Bank Account Number ── (replaced Bank Name)
+    fields["Bank A/C No"] = find_regex([
+        r"(?:Bank\s*A/?C\s*No\.?|Account\s*(?:No|Number)\.?)[\s:\-]*([0-9]{9,18})\b",
+        r"A/?C\s*No\.?[\s:\-]*([0-9]{9,18})\b",
+        r"BankA/cNo\s*([0-9]{9,18})\b",
     ])
 
     return {k: v.strip() if v else "" for k, v in fields.items()}
@@ -328,16 +381,16 @@ def style_row(row):
     return [""] * (len(row) - 1) + [style]
 
 SECTIONS = {
-    "🏭 Exporter & Registration":  ["Exporter Name", "IEC", "GSTIN", "PAN", "AD Code", "Bank Name"],
-    "📄 Invoice Reference":        ["Invoice No", "Invoice Date", "Buyer / Consignee", "Buyer PO No"],
-    "🚢 Shipment Details":         ["Country of Origin", "Country of Destination",
-                                    "Port of Loading", "Port of Discharge",
-                                    "Delivery Terms (Incoterm)", "Payment Terms",
-                                    "Mode of Transport", "Marks & Nos"],
-    "💰 Financial Details":        ["Currency", "Total Invoice Value", "FOB Value",
-                                    "Gross Weight", "Net Weight", "No. of Packages",
-                                    "HSN Code"],
-    "📋 Export Scheme / Duty":     ["LUT / Bond", "DBK / Drawback", "RoDTEP", "IGST Refund"],
+    "🏭 Exporter & Registration": ["Exporter Name", "IEC", "GSTIN", "PAN", "AD Code", "Bank A/C No"],
+    "📄 Invoice Reference":       ["Invoice No", "Invoice Date", "Buyer / Consignee", "Buyer PO No"],
+    "🚢 Shipment Details":        ["Country of Origin", "Country of Destination",
+                                   "Port of Loading", "Port of Discharge",
+                                   "Delivery Terms (Incoterm)", "Payment Terms",
+                                   "Mode of Transport", "Marks & Nos"],
+    "💰 Financial Details":       ["Currency", "Total Invoice Value", "FOB Value",
+                                   "Gross Weight", "Net Weight", "No. of Packages",
+                                   "HSN Code"],
+    "📋 Export Scheme / Duty":    ["LUT / Bond", "DBK / Drawback", "RoDTEP", "IGST Refund"],
 }
 
 def render_section(title, fields, df):
@@ -353,7 +406,7 @@ def render_section(title, fields, df):
     st.markdown("<br>", unsafe_allow_html=True)
 
 
-# ── APP STARTS HERE ──
+# ── APP ──
 
 st.markdown("""
 <div class="app-header">
@@ -387,10 +440,10 @@ with st.spinner("Reading documents…"):
 
     df = build_comparison_table(inv_data, pack_data, chk_data)
 
-matched   = (df["Status"] == "✅ Match").sum()
-mismatch  = (df["Status"] == "⚠️ Mismatch").sum()
-missing   = (df["Status"] == "❌ Missing").sum()
-total     = len(df)
+matched  = (df["Status"] == "✅ Match").sum()
+mismatch = (df["Status"] == "⚠️ Mismatch").sum()
+missing  = (df["Status"] == "❌ Missing").sum()
+total    = len(df)
 
 t1, t2, t3, t4 = st.columns(4)
 with t1:
@@ -410,17 +463,19 @@ critical_issues = df[
     (df["Status"] != "✅ Match")
 ]
 if not critical_issues.empty:
-    lines = ""
+    lines_html = ""
     for _, row in critical_issues.iterrows():
         icon = "⚠️" if row["Status"] == "⚠️ Mismatch" else "❌"
-        lines += f'<div class="critical-item">{icon} <b>{row["Field"]}</b> — {row["Status"]}'
+        lines_html += f'<div class="critical-item">{icon} <b>{row["Field"]}</b> — {row["Status"]}'
         if row["Status"] == "⚠️ Mismatch":
-            lines += f' &nbsp;|&nbsp; Invoice: <code>{row["Invoice"]}</code> Packing: <code>{row["Packing List"]}</code> Checklist: <code>{row["Checklist"]}</code>'
-        lines += '</div>'
+            lines_html += (f' &nbsp;|&nbsp; Invoice: <code>{row["Invoice"]}</code>'
+                           f' Packing: <code>{row["Packing List"]}</code>'
+                           f' Checklist: <code>{row["Checklist"]}</code>')
+        lines_html += '</div>'
     st.markdown(f"""
     <div class="critical-box">
         <h4>🚨 Critical Issues — Resolve before export clearance</h4>
-        {lines}
+        {lines_html}
     </div>
     """, unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
@@ -440,10 +495,10 @@ with st.expander("🔍 View extracted raw text (debug)"):
                 st.caption("No document uploaded.")
 
 st.markdown("---")
-csv = df.to_csv(index=False).encode("utf-8")
+csv_data = df.to_csv(index=False).encode("utf-8")
 st.download_button(
     label="⬇️ Download Full Report (CSV)",
-    data=csv,
+    data=csv_data,
     file_name="export_verification_report.csv",
     mime="text/csv",
 )
