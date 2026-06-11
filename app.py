@@ -75,157 +75,209 @@ def extract_text(uploaded_file):
         return ""
 
 
-def find(patterns, text):
-    for pat in patterns:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            if val and val not in ("&", "-", "–", "/", ""):
-                return val
-    return ""
-
-
 def extract_fields(text):
-    t = text
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    full = text
+
+    def line_after(keyword_patterns):
+        for i, line in enumerate(lines):
+            for pat in keyword_patterns:
+                m = re.search(pat, line, re.IGNORECASE)
+                if m:
+                    after = line[m.end():].strip().lstrip(":-").strip()
+                    if after and len(after) > 1 and after not in ("&", "-", ""):
+                        return after
+                    if i + 1 < len(lines):
+                        nxt = lines[i + 1].strip()
+                        if nxt and len(nxt) > 1:
+                            return nxt
+        return ""
+
+    def find_regex(patterns):
+        for pat in patterns:
+            m = re.search(pat, full, re.IGNORECASE)
+            if m:
+                val = m.group(1).strip()
+                if val and val not in ("&", "-", "–", "/", ""):
+                    return val
+        return ""
+
     fields = {}
 
-    fields["Exporter Name"] = find([
-        r"(?:exporter|shipper|seller|from)[:\s]+([A-Z][A-Z0-9 &.,\-]+(?:LTD|PVT|LLC|INC|CORP|CO\.?)?)",
-        r"^([A-Z][A-Z0-9 &.,\-]{5,50}(?:LTD|PVT|LLC|INC|CORP)\.?)",
-    ], t)
+    # Exporter Name
+    for line in lines[:15]:
+        if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b', line, re.IGNORECASE):
+            fields["Exporter Name"] = line
+            break
+    else:
+        fields["Exporter Name"] = ""
 
-    fields["IEC"] = find([
-        r"IEC\s*[:\-#]?\s*([A-Z0-9]{10})",
-        r"Import\s+Export\s+Code[:\s]+([A-Z0-9]{10})",
-        r"\bIEC\b\D{0,5}([A-Z0-9]{10})",
-    ], t)
+    # IEC
+    fields["IEC"] = find_regex([
+        r"\bIEC\b[\s:\-#]*([A-Z0-9]{10})\b",
+        r"\bIEC\s*CODE\b[\s:\-]*([A-Z0-9]{10})\b",
+    ])
 
-    fields["GSTIN"] = find([
-        r"GSTIN?\s*[:\-#]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})",
-        r"GST\s+No\.?\s*[:\-]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})",
-    ], t)
+    # GSTIN
+    fields["GSTIN"] = find_regex([
+        r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b",
+    ])
 
-    fields["PAN"] = find([
-        r"PAN\s*[:\-#]?\s*([A-Z]{5}[0-9]{4}[A-Z]{1})",
-    ], t)
+    # PAN
+    fields["PAN"] = find_regex([
+        r"\b([A-Z]{5}[0-9]{4}[A-Z])\b",
+    ])
 
-    fields["AD Code"] = find([
-        r"AD\s*Code\s*[:\-]?\s*([0-9]{7,14})",
-        r"Authorised\s+Dealer\s*[:\-]?\s*([0-9]{7,14})",
-    ], t)
+    # AD Code
+    fields["AD Code"] = find_regex([
+        r"AD\s*Code[\s:\-]*([0-9]{7,14})",
+    ])
 
-    fields["Invoice No"] = find([
-        r"Invoice\s*(?:No|Number|#)\s*[:\-]?\s*([A-Z0-9/\-]{3,25})",
-        r"Inv\.?\s*No\.?\s*[:\-]?\s*([A-Z0-9/\-]{3,25})",
-    ], t)
+    # Invoice No
+    fields["Invoice No"] = line_after([
+        r"Invoice\s*(No|Number|#)",
+        r"Inv\.?\s*No\.?",
+    ])
+    if not fields["Invoice No"]:
+        fields["Invoice No"] = find_regex([
+            r"Invoice\s*(?:No|Number|#)[\s:\-]*([A-Z0-9][A-Z0-9/\-]{2,20})",
+        ])
 
-    fields["Invoice Date"] = find([
-        r"Invoice\s+Date\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
-        r"Date\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
-        r"Dated?\s*[:\-]?\s*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
-    ], t)
+    # Invoice Date
+    fields["Invoice Date"] = find_regex([
+        r"(?:Invoice\s+)?Date[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        r"Dated?[\s:\-]*(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})",
+        r"\b(\d{2}[\/\-]\d{2}[\/\-]\d{4})\b",
+    ])
 
-    fields["Buyer / Consignee"] = find([
-        r"(?:buyer|consignee|bill\s+to|sold\s+to)[:\s]+([A-Z][A-Z0-9 &.,\-]{4,60})",
-    ], t)
+    # Buyer / Consignee
+    fields["Buyer / Consignee"] = line_after([
+        r"^Consignee",
+        r"^Buyer[\s:$]",
+        r"Bill\s+To",
+    ])
 
-    fields["Buyer PO No"] = find([
-        r"(?:P\.?O\.?\s*(?:No|Number|#)|Purchase\s+Order)\s*[:\-]?\s*([A-Z0-9/\-]{3,25})",
-    ], t)
+    # Buyer PO No
+    fields["Buyer PO No"] = find_regex([
+        r"P\.?O\.?\s*(?:No|Number|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
+        r"Purchase\s+Order[\s:\-]*([A-Z0-9/\-]{3,25})",
+    ])
 
-    fields["Country of Origin"] = find([
-        r"Country\s+of\s+Origin\s*[:\-]?\s*([A-Za-z ]{3,30})",
-    ], t)
+    # Country of Origin
+    fields["Country of Origin"] = find_regex([
+        r"Country\s+of\s+Origin[\s:\-]*([A-Z][a-zA-Z ]{2,25}?)(?:\s+Country|\s+of|\n|$)",
+        r"Origin\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
+    ])
 
-    fields["Country of Destination"] = find([
-        r"Country\s+of\s+(?:Destination|Final\s+Destination)\s*[:\-]?\s*([A-Za-z ]{3,30})",
-        r"(?:Destination|Final\s+Destination)\s+Country\s*[:\-]?\s*([A-Za-z ]{3,30})",
-    ], t)
+    # Country of Destination
+    fields["Country of Destination"] = find_regex([
+        r"Country\s+of\s+(?:Final\s+)?Destination[\s:\-]*([A-Z][a-zA-Z ]{2,25}?)(?:\s+Country|\n|$)",
+        r"Final\s+Destination\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
+        r"Destination\s+Country[\s:\-]*([A-Z][a-zA-Z ]{2,20})",
+    ])
 
-    fields["Port of Loading"] = find([
-        r"Port\s+of\s+Loading\s*[:\-]?\s*([A-Za-z ,()]{3,40})",
-        r"Loading\s+Port\s*[:\-]?\s*([A-Za-z ,()]{3,40})",
-        r"POL\s*[:\-]?\s*([A-Za-z ,()]{3,40})",
-    ], t)
+    # Port of Loading
+    fields["Port of Loading"] = find_regex([
+        r"Port\s+of\s+Loading[\s:\-]*([A-Z][a-zA-Z() ]{3,35}?)(?:\s+Port|\s+of|\n|$)",
+        r"Loading\s+Port[\s:\-]*([A-Z][a-zA-Z() ]{3,35})",
+        r"\bPOL[\s:\-]+([A-Z][a-zA-Z() ]{3,35})",
+    ])
 
-    fields["Port of Discharge"] = find([
-        r"Port\s+of\s+(?:Discharge|Destination)\s*[:\-]?\s*([A-Za-z ,()]{3,40})",
-        r"POD\s*[:\-]?\s*([A-Za-z ,()]{3,40})",
-    ], t)
+    # Port of Discharge
+    fields["Port of Discharge"] = find_regex([
+        r"Port\s+of\s+Discharge[\s:\-]*([A-Z][a-zA-Z() ]{3,35}?)(?:\s+Port|\s+of|\n|$)",
+        r"Discharge\s+Port[\s:\-]*([A-Z][a-zA-Z() ]{3,35})",
+        r"\bPOD[\s:\-]+([A-Z][a-zA-Z() ]{3,35})",
+    ])
 
-    fields["Delivery Terms (Incoterm)"] = find([
-        r"\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT)\b(?:\s+[A-Za-z, ]{2,30})?",
-    ], t)
+    # Incoterm
+    fields["Delivery Terms (Incoterm)"] = find_regex([
+        r"\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b",
+    ])
 
-    fields["Payment Terms"] = find([
-        r"Payment\s+Terms?\s*[:\-]?\s*([A-Za-z0-9 ,/\-]{3,50})",
-        r"(?:T\/T|L\/C|DP|DA|CAD|Advance|Sight)\b(.{0,30})",
-    ], t)
+    # Payment Terms
+    fields["Payment Terms"] = find_regex([
+        r"Payment\s+Terms?[\s:\-]*([A-Za-z0-9 ,/\-]{4,50}?)(?:\n|$)",
+        r"\b(T/?T|L/?C|DP|DA|CAD|Advance|Sight\s+L/?C|Usance)[^\n]{0,30}",
+    ])
 
-    fields["Mode of Transport"] = find([
-        r"(?:Mode\s+of\s+)?Transport(?:ation)?\s*[:\-]?\s*([A-Za-z ]{3,25})",
+    # Mode of Transport
+    fields["Mode of Transport"] = find_regex([
+        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]*([A-Za-z ]{3,20})",
         r"\b(Sea|Air|Road|Rail|Multimodal)\b",
-    ], t)
+    ])
 
-    fields["Marks & Nos"] = find([
-        r"Marks?\s*(?:&|and)\s*No[s.]?\s*[:\-]?\s*([^\n]{3,60})",
-    ], t)
+    # Marks & Nos
+    fields["Marks & Nos"] = find_regex([
+        r"Marks?\s*(?:&|and)\s*Nos?[\s:\-]*([^\n]{3,50})",
+    ])
 
-    fields["Currency"] = find([
-        r"\b(USD|EUR|GBP|INR|AED|JPY|CNY|SGD)\b",
-        r"Currency\s*[:\-]?\s*([A-Z]{3})",
-    ], t)
+    # Currency
+    fields["Currency"] = find_regex([
+        r"\b(USD|EUR|GBP|INR|AED|JPY|CNY|SGD|CAD|AUD)\b",
+    ])
 
-    fields["Total Invoice Value"] = find([
-        r"(?:Total|Grand\s+Total|Invoice\s+Value|Amount\s+Due)\s*[:\-]?\s*(?:[A-Z]{0,3}\s*)?([0-9,]+\.?[0-9]{0,2})",
-    ], t)
+    # Total Invoice Value
+    fields["Total Invoice Value"] = find_regex([
+        r"(?:Total\s+Invoice\s+Value|Grand\s+Total|Invoice\s+Total|Amount\s+Due)[\s:\-]*(?:[A-Z]{0,3}\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
+        r"Total[\s:\-]*(?:USD|EUR|GBP|INR|AED)?\s*([0-9,]{4,}\.?[0-9]{0,2})",
+    ])
 
-    fields["FOB Value"] = find([
-        r"FOB\s+Value\s*[:\-]?\s*(?:[A-Z]{0,3}\s*)?([0-9,]+\.?[0-9]{0,2})",
-        r"FOB\s+Amount\s*[:\-]?\s*(?:[A-Z]{0,3}\s*)?([0-9,]+\.?[0-9]{0,2})",
-    ], t)
+    # FOB Value
+    fields["FOB Value"] = find_regex([
+        r"FOB\s+(?:Value|Amount|Price)[\s:\-]*(?:[A-Z]{0,3}\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
+    ])
 
-    fields["Gross Weight"] = find([
-        r"Gross\s+(?:Weight|Wt\.?)\s*[:\-]?\s*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-        r"G\.?\s*W\.?\s*[:\-]?\s*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-    ], t)
+    # Gross Weight
+    fields["Gross Weight"] = find_regex([
+        r"Gross\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+        r"G\.?W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+    ])
 
-    fields["Net Weight"] = find([
-        r"Net\s+(?:Weight|Wt\.?)\s*[:\-]?\s*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-        r"N\.?\s*W\.?\s*[:\-]?\s*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
-    ], t)
+    # Net Weight
+    fields["Net Weight"] = find_regex([
+        r"Net\s+(?:Weight|Wt\.?)[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+        r"N\.?W\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3}\s*(?:KGS?|MT|LBS?|KG)?)",
+    ])
 
-    fields["No. of Packages"] = find([
-        r"(?:No\.?\s+of\s+)?(?:Packages?|Cartons?|Boxes|Cases)\s*[:\-]?\s*([0-9]+)",
-        r"Total\s+(?:Cartons?|Packages?)\s*[:\-]?\s*([0-9]+)",
-    ], t)
+    # No. of Packages
+    fields["No. of Packages"] = find_regex([
+        r"(?:No\.?\s+of\s+)?(?:Packages?|Cartons?|Boxes|Cases)[\s:\-]*([0-9]+)",
+        r"Total\s+(?:Cartons?|Packages?)[\s:\-]*([0-9]+)",
+    ])
 
-    fields["LUT / Bond"] = find([
-        r"LUT\s+(?:No\.?|Number|#)?\s*[:\-]?\s*([A-Z0-9/\-]{4,30})",
-        r"Letter\s+of\s+Undertaking\s*[:\-]?\s*([A-Z0-9/\-]{4,30})",
-    ], t)
+    # LUT
+    fields["LUT / Bond"] = find_regex([
+        r"LUT\s*(?:No\.?|Number|#)?[\s:\-]*([A-Z0-9/\-]{4,30})",
+        r"Letter\s+of\s+Undertaking[\s:\-]*([A-Z0-9/\-]{4,30})",
+    ])
 
-    fields["DBK / Drawback"] = find([
-        r"(?:DBK|Drawback)\s*(?:Scheme|No\.?)?\s*[:\-]?\s*([A-Za-z0-9 /\-]{2,30})",
-    ], t)
+    # DBK
+    fields["DBK / Drawback"] = find_regex([
+        r"(?:DBK|Drawback)[\s:\-]*([A-Za-z0-9 /\-]{2,25})",
+    ])
 
-    fields["RoDTEP"] = find([
-        r"RoDTEP\s*(?:Rate|%|No\.?)?\s*[:\-]?\s*([A-Za-z0-9 .%/\-]{2,20})",
-    ], t)
+    # RoDTEP
+    fields["RoDTEP"] = find_regex([
+        r"RoDTEP[\s:\-]*([A-Za-z0-9 .%/\-]{2,20})",
+    ])
 
-    fields["IGST Refund"] = find([
-        r"IGST\s*(?:Refund|Paid|Amount)?\s*[:\-]?\s*(?:Rs\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
-    ], t)
+    # IGST
+    fields["IGST Refund"] = find_regex([
+        r"IGST[\s:\-]*(?:Rs\.?\s*)?([0-9,]+\.?[0-9]{0,2})",
+    ])
 
-    fields["HSN Code"] = find([
-        r"HSN\s*(?:Code|No\.?)?\s*[:\-]?\s*([0-9]{4,8})",
-        r"HS\s+Code\s*[:\-]?\s*([0-9]{4,8})",
-    ], t)
+    # HSN Code
+    fields["HSN Code"] = find_regex([
+        r"HSN\s*(?:Code|No\.?)?[\s:\-]*([0-9]{4,8})\b",
+        r"HS\s+Code[\s:\-]*([0-9]{4,8})\b",
+    ])
 
-    fields["Bank Name"] = find([
-        r"Bank\s*[:\-]?\s*([A-Za-z ]{3,50}(?:Bank|BANK))",
-        r"(?:Banker|Through\s+Bank)\s*[:\-]?\s*([A-Za-z ]{3,50})",
-    ], t)
+    # Bank Name
+    fields["Bank Name"] = find_regex([
+        r"(?:Banker|Bank\s+Name|Through\s+Bank|Remittance\s+Bank)[\s:\-]*([A-Za-z ]{3,50}(?:Bank|BANK))",
+        r"([A-Z][A-Za-z ]{3,40}(?:BANK|Bank\s+(?:Ltd|Limited)))",
+    ])
 
     return {k: v.strip() if v else "" for k, v in fields.items()}
 
