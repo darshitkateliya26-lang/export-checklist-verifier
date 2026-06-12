@@ -4,11 +4,7 @@ import pandas as pd
 import re
 import io
 
-st.set_page_config(
-    page_title="Export Checklist Verifier",
-    page_icon="🚢",
-    layout="wide",
-)
+st.set_page_config(page_title="Export Checklist Verifier", page_icon="🚢", layout="wide")
 
 st.markdown("""
 <style>
@@ -17,15 +13,13 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 .stApp { background: #F0F4F8; }
 .app-header {
     background: linear-gradient(135deg, #0F2D52 0%, #1A5276 100%);
-    color: white; padding: 1.5rem 2rem;
-    border-radius: 12px; margin-bottom: 1.5rem;
+    color: white; padding: 1.5rem 2rem; border-radius: 12px; margin-bottom: 1.5rem;
 }
 .app-header h1 { margin: 0; font-size: 1.6rem; font-weight: 700; }
 .app-header p  { margin: 0; font-size: 0.85rem; opacity: 0.75; }
 .section-head {
-    background: #1A5276; color: white;
-    padding: 0.55rem 1rem; border-radius: 6px 6px 0 0;
-    font-size: 0.8rem; font-weight: 600;
+    background: #1A5276; color: white; padding: 0.55rem 1rem;
+    border-radius: 6px 6px 0 0; font-size: 0.8rem; font-weight: 600;
     letter-spacing: 0.8px; text-transform: uppercase;
 }
 .tile { border-radius: 10px; padding: 1rem 1.2rem; text-align: center; }
@@ -45,368 +39,390 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 """, unsafe_allow_html=True)
 
 
-def extract_text(uploaded_file):
+# ─────────────────────────────────────────────────────────────────────
+# PDF helpers
+# ─────────────────────────────────────────────────────────────────────
+
+def get_words(uploaded_file):
+    if uploaded_file is None:
+        return []
+    try:
+        uploaded_file.seek(0)
+        with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
+            all_words, offset = [], 0
+            for page in pdf.pages:
+                for w in page.extract_words():
+                    all_words.append({"text": w["text"],
+                                      "x0":   w["x0"],
+                                      "top":  w["top"] + offset})
+                offset += page.height
+            return all_words
+    except Exception as e:
+        st.warning(f"Could not read PDF: {e}")
+        return []
+
+
+def get_raw_text(uploaded_file):
     if uploaded_file is None:
         return ""
     try:
+        uploaded_file.seek(0)
         with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
-            pages = []
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    pages.append(t)
-        return "\n".join(pages)
-    except Exception as e:
-        st.warning(f"Could not read PDF: {e}")
+            return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    except:
         return ""
 
 
-def extract_fields(text):
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    full = text
+def wb(words, y1, y2, x1=0, x2=600):
+    """Words in a bounding box."""
+    return [w for w in words if y1 <= w["top"] <= y2 and x1 <= w["x0"] < x2]
 
-    def fr(patterns):
-        for pat in patterns:
-            m = re.search(pat, full, re.IGNORECASE)
-            if m:
-                val = m.group(1).strip()
-                if val and val not in ("&", "-", "–", "/", ""):
-                    return val
-        return ""
 
-    fields = {}
+def wt(words, y1, y2, x1=0, x2=600):
+    """Text of words in a bounding box."""
+    return " ".join(w["text"] for w in wb(words, y1, y2, x1, x2)).strip()
 
-    # ── Exporter Name ──
-    # Invoice/PL: "OMNI LENS PVT. LTD." appears early, skip CHA lines
-    # Checklist: appears after "EXPORTER DETAILS" block
-    exporter = ""
-    # Try after EXPORTER DETAILS label first (checklist)
-    for i, line in enumerate(lines):
-        if re.search(r'EXPORTER\s+DETAILS', line, re.IGNORECASE):
-            # IEC number is on same/next line, company name follows after
-            for j in range(i+1, min(i+6, len(lines))):
-                candidate = lines[j].strip()
-                if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b',
-                             candidate, re.IGNORECASE):
-                    if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b|CUSTOM|GSTIN|PAN\s)',
-                                     candidate, re.IGNORECASE):
-                        exporter = candidate
-                        break
-            break
-    # Fallback: first company-looking line in top 20
-    if not exporter:
-        for line in lines[:20]:
-            if re.search(r'\b(PVT|LTD|LLC|INC|CORP|EXPORTS?|TRADERS?|INDUSTRIES|ENTERPRISE)\b',
-                         line, re.IGNORECASE):
-                if not re.search(r'(CLEARING|AGENCY|FREIGHT|FORWARDER|CHA\b|CUSTOM|GSTIN|PAN\s)',
-                                 line, re.IGNORECASE):
-                    exporter = line.strip()
-                    break
-    fields["Exporter Name"] = exporter
 
-    # ── IEC ──
-    # Invoice/PL: "IEC CODE : 0893006939"  on header line
-    # Checklist: "0893006939 GSTIN: ..." — IEC is first token after EXPORTER DETAILS
-    fields["IEC"] = fr([
-        r"IEC\s*(?:CODE)?[\s:\-#]*([0-9]{10})\b",
-        r"\bIEC\b[\s\S]{0,10}([0-9]{10})\b",
-        # Checklist: standalone 10-digit number at start of line after EXPORTER DETAILS
-        r"(?:^|\n)\s*([0-9]{10})\s+GSTIN",
-    ])
+def detect_doc_type(words):
+    full = " ".join(w["text"] for w in words[:60]).upper()
+    if "CHECKLIST FOR SHIPPING BILL" in full or "SKYLINE AIR" in full:
+        return "checklist"
+    if "PACKING LIST" in full:
+        return "packing"
+    return "invoice"
 
-    # ── GSTIN ──
-    fields["GSTIN"] = fr([
-        r"\b([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])\b",
-    ])
 
-    # ── PAN ──
-    fields["PAN"] = fr([
-        r"PAN\s*(?:No\.?|:)?\s*([A-Z]{5}[0-9]{4}[A-Z])\b",
-        r"\b([A-Z]{5}[0-9]{4}[A-Z])\b",
-    ])
+# ─────────────────────────────────────────────────────────────────────
+# INVOICE EXTRACTOR
+# Verified coordinates from sample_invoice__2_.pdf (595×842 pt)
+# ─────────────────────────────────────────────────────────────────────
 
-    # ── AD Code ──
-    # Invoice/PL: "Bank AD Code :8656901"
-    # Checklist:  "Ad. Code 8656901"
-    fields["AD Code"] = fr([
-        r"(?:Bank\s+)?AD\s*\.?\s*Code[\s:\-]*([0-9]{7})\b",
-        r"Ad\.\s*Code[\s:\-]*([0-9]{7})\b",
-    ])
+def extract_invoice(words):
+    full = " ".join(w["text"] for w in words)
+    f = {}
 
-    # ── Invoice No ──
-    # Seen: "E/GST/043/26-27" in invoice header and checklist
-    # Invoice header line: "Invoice No & Date IEC CODE : 0893006939 ... E/GST/043/26-27"
-    fields["Invoice No"] = fr([
-        r"\b(E/(?:GST|LUT)/[0-9]+/[0-9\-]+)\b",
-        r"Inv\.?\s*No\.?[\s:\-]*([A-Z0-9]{1,6}/[A-Z0-9/\-]{3,20})",
-        r"Invoice\s*No[\s:\-]*([A-Z0-9]{1,6}/[A-Z0-9/\-]{3,20})",
-        r"\b([0-9]{4}/[0-9]{2,3}/[0-9]{2,4})\b",
-    ])
+    # 1. Exporter Name  y≈43  x 21-200
+    f["Exporter Name"] = wt(words, 40, 50, 21, 230)
 
-    # ── Invoice Date ──
-    # Seen: "09.06.2026"
-    fields["Invoice Date"] = fr([
-        r"(?:Inv\.?\s*Date|Invoice\s+Date)[\s:\-]*(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})",
-        r"\b(\d{2}[./\-]\d{2}[./\-]\d{4})\b",
-        r"\b(\d{1,2}[-\s](?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-\s]\d{4})\b",
-    ])
+    # 2. IEC  y≈31  x 460+  → strip label "IEC CODE :"
+    iec_t = wt(words, 28, 38, 460, 600)
+    m = re.search(r'([0-9]{10})', iec_t)
+    f["IEC"] = m.group(1) if m else ""
 
-    # ── Buyer / Consignee ──
-    # Seen: "MD TECH srl" after Consignee label
-    consignee = ""
-    for i, line in enumerate(lines):
-        if re.search(r'\bConsignee\b', line, re.IGNORECASE):
-            for j in range(i+1, min(i+5, len(lines))):
-                nxt = lines[j].strip()
-                if (nxt and len(nxt) > 3
-                        and not re.search(r'\b(if other|consignee|buyer|name|address)\b', nxt, re.IGNORECASE)
-                        and not nxt.startswith((':', '-', '.'))):
-                    consignee = nxt
-                    break
-            break
-    # Checklist: consignee is after "CONSIGNEE" header
-    if not consignee:
-        for i, line in enumerate(lines):
-            if re.search(r'^CONSIGNEE$', line, re.IGNORECASE):
-                if i + 1 < len(lines):
-                    consignee = lines[i+1].strip()
-                break
-    fields["Buyer / Consignee"] = consignee
+    # 3. GSTIN  y≈102  x 440+
+    gstin_t = wt(words, 99, 108, 440, 600)
+    m = re.search(r'([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])', gstin_t)
+    f["GSTIN"] = m.group(1) if m else ""
 
-    # ── Buyer PO No ──
-    fields["Buyer PO No"] = fr([
-        r"(?:Buyer'?s?\s+)?Order\s*(?:No\.?|Number|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
-        r"P\.?O\.?\s*(?:No|#)[\s:\-]*([A-Z0-9/\-]{3,25})",
-    ])
+    # 4. PAN  y≈66  x 460+
+    pan_t = wt(words, 63, 72, 460, 600)
+    m = re.search(r'([A-Z]{5}[0-9]{4}[A-Z])', pan_t)
+    f["PAN"] = m.group(1) if m else ""
 
-    # ── Country of Origin ──
-    # Invoice/PL: "Country of origin of goods ... INDIA"
-    # The line is: "Country of origin of goods Country of final Destination"
-    # Then next line: "INDIA ITALY"
-    # So we need to find INDIA after this label
-    co_origin = fr([
-        r"Country\s+of\s+origin\s+of\s+goods[\s\S]{0,60}?(INDIA|[A-Z]{4,20})\s+(?:[A-Z]{4,20}|$)",
-    ])
-    if not co_origin:
-        # Next line approach: find line with "Country of origin" then grab first word of next line
-        for i, line in enumerate(lines):
-            if re.search(r'Country\s+of\s+origin', line, re.IGNORECASE):
-                # value may be on same line after label or on next line
-                # Same line: after second occurrence splits
-                m = re.search(r'Country\s+of\s+origin[^\n]*?([A-Z]{4,20})\s*$', line, re.IGNORECASE)
-                if m:
-                    co_origin = m.group(1)
-                    break
-                if i + 1 < len(lines):
-                    # Next line: first word
-                    nxt = lines[i+1].strip()
-                    first_word = nxt.split()[0] if nxt.split() else ""
-                    if re.match(r'^[A-Z]{3,20}$', first_word):
-                        co_origin = first_word
-                        break
-    # Checklist direct
-    if not co_origin:
-        co_origin = fr([r"Country\s+of\s+[Oo]rigin[\s:\-]+([A-Z][A-Za-z]{2,20})\b"])
-    fields["Country of Origin"] = co_origin
+    # 5. AD Code  y≈141  x 470+  → 7-digit number
+    ad_t = wt(words, 138, 148, 470, 600)
+    m = re.search(r'([0-9]{7})', ad_t)
+    f["AD Code"] = m.group(1) if m else ""
 
-    # ── Country of Destination ──
-    # Invoice/PL: same line as origin "Country of final Destination" → ITALY (second word on next line)
-    # Checklist: "Country of Dest Italy" or "Discharge Country Italy"
-    co_dest = fr([
-        r"(?:Country\s+of\s+(?:final\s+)?[Dd]est(?:ination)?|Discharge\s+Country)[\s:\-]+([A-Z][A-Za-z]{2,20})\b",
-    ])
-    if not co_dest:
-        for i, line in enumerate(lines):
-            if re.search(r'Country\s+of\s+(?:final\s+)?Dest', line, re.IGNORECASE):
-                m = re.search(r'Country\s+of\s+(?:final\s+)?Dest[^\n]*?([A-Z]{4,20})\s*$', line, re.IGNORECASE)
-                if m:
-                    co_dest = m.group(1)
-                    break
-                if i + 1 < len(lines):
-                    nxt = lines[i+1].strip().split()
-                    # second word on next line (first = origin country)
-                    if len(nxt) >= 2 and re.match(r'^[A-Z]{3,20}$', nxt[1]):
-                        co_dest = nxt[1]
-                        break
-                    elif len(nxt) >= 1 and re.match(r'^[A-Z]{3,20}$', nxt[0]):
-                        co_dest = nxt[0]
-                        break
-    fields["Country of Destination"] = co_dest
+    # 6. Bank A/C No  y≈294  x 380+
+    bank_t = wt(words, 291, 300, 380, 600)
+    m = re.search(r'([0-9]{9,18})', bank_t)
+    f["Bank A/C No"] = m.group(1) if m else ""
 
-    # ── Port of Loading ──
-    # Invoice/PL: "Port of Loading\nAHMEDABAD-INDIA"  or  "Port of Loading AHMEDABAD-INDIA"
-    # Checklist:  "Port Of Loading Ahmedabad Air Cargo(INAMD4)"
-    fields["Port of Loading"] = fr([
-        r"Port\s+[Oo]f\s+Loading[\s:\-]+([A-Za-z][A-Za-z0-9 \-()]{3,40}?)(?=\s*(?:\n|Port|Nature|Country|$))",
-        r"Port\s+[Oo]f\s+Loading[\s\n:\-]+([A-Za-z][A-Za-z0-9 \-]{3,30})",
-    ])
+    # 7. Invoice No  y≈66  x 240-420  pattern E/LUT/ or E/GST/
+    inv_t = wt(words, 63, 72, 240, 420)
+    m = re.search(r'(E/(?:LUT|GST)/[0-9]+/[0-9\-]+)', inv_t, re.IGNORECASE)
+    f["Invoice No"] = m.group(1) if m else inv_t
 
-    # ── Port of Discharge ──
-    # Invoice/PL: "Port of Discharge\nMILAN" then "Final Destination\nMILAN ITALY"
-    # Checklist:  "Port Of Discharge Milano(ITMIL)"
-    fields["Port of Discharge"] = fr([
-        r"Port\s+[Oo]f\s+Discharge[\s:\-]+([A-Za-z][A-Za-z0-9 \-()]{2,30}?)(?=\s*(?:\n|Port|Final|Country|$))",
-        r"Port\s+[Oo]f\s+Discharge[\s\n:\-]+([A-Za-z][A-Za-z0-9 \-]{2,25})",
-    ])
+    # 8. Invoice Date  y≈102  x 240-360
+    date_t = wt(words, 99, 108, 240, 360)
+    m = re.search(r'(\d{1,2}[./\-]\d{1,2}[./\-]\d{4})', date_t)
+    f["Invoice Date"] = m.group(1) if m else ""
 
-    # ── Incoterm ──
-    fields["Delivery Terms (Incoterm)"] = fr([
-        r"\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b",
-    ])
+    # 9. Buyer/Consignee — first full line below "Consignee" label y≈165
+    #    actual company name at y≈176, x 21-230
+    f["Buyer / Consignee"] = wt(words, 173, 182, 21, 230)
 
-    # ── Payment Terms ──
-    # Seen: "Payment within 180 days from the date of shipment"
-    # Checklist: "Nature Of Payment DA  Period Of Payment 180 days"
-    fields["Payment Terms"] = fr([
-        r"Nature\s+Of\s+Payment[\s:\-]+([A-Za-z]{2,10})",
-        r"Payment\s+within[\s:\-]+([0-9]+\s*days?[^,\n]{0,30})",
-        r"\b(DA\s+\d+\s*[Dd]ays?|DP\s+\d+\s*[Dd]ays?|Advance|T/?T|L/?C)\b",
-        r"\b(DA|DP|TT|LC|Advance)\b",
-    ])
+    # 10. Buyer PO No — y≈117 right side, strip label
+    po_t = wt(words, 114, 125, 336, 600)
+    f["Buyer PO No"] = po_t.strip(": ") if po_t and po_t != ":" else ""
 
-    # ── Mode of Transport ──
-    fields["Mode of Transport"] = fr([
-        r"Mode\s+of\s+(?:Transport|Shipment)[\s:\-]+([A-Za-z]{3,15})",
-        r"\b(Sea|Air|Road|Rail|Multimodal)\b",
-        r"CIF\s+BY\s+\(([A-Za-z]+)\)",
-    ])
+    # 11. Country of Origin  y≈228  x 300-462
+    f["Country of Origin"] = wt(words, 225, 235, 300, 462)
 
-    # ── Marks & Nos ──
-    # Seen: "Crtn.SR.no 01 to 01 Total Cartons : 01"
-    # Checklist: "WE INTEND TO CLAIM REWARDS RODTEP"
-    fields["Marks & Nos"] = fr([
-        r"Marks?\s*(?:&|and)\s*[Nn]o[s.]?[\s:\-]+([^\n]{3,60})",
-        r"(Crtn\.SR\.no[^\n]{3,40})",
-        r"(WE\s+INTEND\s+TO[^\n]{5,50})",
-    ])
+    # 12. Country of Destination  y≈228  x 462+
+    f["Country of Destination"] = wt(words, 225, 235, 462, 600)
 
-    # ── Currency ──
-    # Invoice: "EURO" and "EUR"
-    foreign = fr([r"\b(EUR|USD|GBP|AED|JPY|CNY|SGD|CAD|AUD)\b"])
-    fields["Currency"] = foreign if foreign else fr([r"\b(INR)\b"])
+    # 13. Port of Loading  y≈297  x 160-300
+    f["Port of Loading"] = wt(words, 294, 304, 160, 300)
 
-    # ── Total Invoice Value ──
-    # Invoice: "Total Tax Value (Rs.) 34697.80"  ← this is IGST only, NOT total
-    # Real total: "6352.00" (EUR) or "EURO SIX THOUSAND..." → 6352.00
-    # Checklist: "Inv. Value EUR 6352.00 (INR 693956.00)"
-    fields["Total Invoice Value"] = fr([
-        r"Inv\.?\s*Value\s+(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
-        r"(?:Invoice|Inv\.?)\s*(?:Value|Amount)[\s:\-]*(?:EUR|USD|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
-        r"Amount\s+Chargeable[^\n]*\n[^\n]*?([0-9,]{3,}\.?[0-9]{0,2})\s*$",
-        # Last number on the "Amount Chargeable" line
-        r"(?:EUR|USD|GBP)\s+(?:[A-Z ]+\s+)?([0-9,]+\.?[0-9]{0,2})\s*$",
-        r"(?:IGST\s+Taxable\s+Value|Inv\.?\s*Value)[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
-    ])
+    # 14. Port of Discharge  y≈319  x 60-175
+    f["Port of Discharge"] = wt(words, 316, 325, 60, 175)
 
-    # ── FOB Value ──
-    # Invoice: "Before Tax Value (Rs.) 693956.00"  ← INR FOB
-    # Checklist: "FOB Value EUR 6337.00 (INR 692317.25)" or "Total FOB (INR) 692317.25"
-    fields["FOB Value"] = fr([
-        r"FOB\s+Value\s+(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.?[0-9]{0,2})",
-        r"Total\s+FOB\s*\([A-Z]+\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"FOB\s+Val(?:ue)?\s*\([A-Z]+\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"Before\s+Tax\s+Value\s*\([A-Z]+\.?\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"FOB[\s:\-]+(?:EUR|USD|GBP|INR|AED)?\s*([0-9,]+\.?[0-9]{0,2})",
-    ])
+    # 15. Delivery Terms (Incoterm)  y≈311  x 355+  "EX-WORKS (AHMEDABAD)" / "CIF" etc.
+    inco_t = wt(words, 308, 317, 355, 600)
+    m = re.search(r'\b(FOB|CIF|CFR|EXW|EX.WORKS|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b', inco_t, re.IGNORECASE)
+    if m:
+        f["Delivery Terms (Incoterm)"] = m.group(1).upper()
+    else:
+        f["Delivery Terms (Incoterm)"] = inco_t
 
-    # ── Gross Weight ──
-    # PL: "6.00"  Checklist: "Gross Weight 6.000 KGS"
-    fields["Gross Weight"] = fr([
-        r"Gross\s+(?:Weight|Wt\.?|wt)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-        r"G\.?\s*W(?:eight|t)?\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-        # PL table: "465 4.50 6.00" — gross is last number in totals row
-        r"Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})",
-    ])
-    # For PL: gross weight is 3rd number in "Total 465 4.50 6.00"
-    if not fields["Gross Weight"]:
-        m = re.search(r'Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})', full)
-        if m:
-            fields["Gross Weight"] = m.group(2)  # last = gross
+    # 16. Payment Terms  y≈252  x 370+
+    pay_t = wt(words, 249, 260, 370, 600)
+    f["Payment Terms"] = pay_t
 
-    # ── Net Weight ──
-    fields["Net Weight"] = fr([
-        r"Net\s+(?:Weight|Wt\.?|wt)[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-        r"N\.?\s*W(?:eight|t)?\.?[\s:\-]*([0-9,]+\.?[0-9]{0,3})\s*(?:KGS?|MT|LBS?|KG)?",
-    ])
-    # For PL: net weight is 2nd number in "Total 465 4.50 6.00"
-    if not fields["Net Weight"]:
-        m = re.search(r'Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})', full)
-        if m:
-            fields["Net Weight"] = m.group(1)  # first = net
+    # 17. Payment Days — from "within 180 days" text or pre-carriage line
+    m = re.search(r'within\s+(\d+)\s*days', full, re.IGNORECASE)
+    if not m:
+        m = re.search(r'(\d+)\s*%\s*Advance', full, re.IGNORECASE)
+        f["Payment Days"] = "" if m else ""
+    else:
+        f["Payment Days"] = m.group(1)
+    # Pre-carriage/FEDEX reference number
+    pre_t = wt(words, 264, 274, 40, 200)
+    if "FEDEX" in pre_t.upper() or "DHL" in pre_t.upper():
+        f["Marks & Nos"] = pre_t
+    else:
+        # 18. Marks & Nos  y≈357-369
+        f["Marks & Nos"] = wt(words, 354, 373, 0, 200)
 
-    # ── No. of Packages ──
-    # Invoice/PL: "Total Cartons : 01"
-    # Checklist: "Total Packages 1 CTN"
-    fields["No. of Packages"] = fr([
-        r"Total\s+(?:Cartons?|Packages?|Pkgs?)[\s:\-]*([0-9]+)\b",
-        r"(?:No\.?\s+of\s+)?(?:Cartons?|Packages?|Boxes|Cases)[\s:\-]*([0-9]+)\b",
-        r"([0-9]+)\s+CTN\b",
-    ])
+    # 19. Currency  y≈342  x 450+  column header
+    curr_t = wt(words, 339, 348, 450, 600)
+    m = re.search(r'\b(EUR|USD|GBP|AED|INR|JPY)\b', curr_t)
+    f["Currency"] = m.group(1) if m else re.search(r'\b(EUR|USD|GBP|AED|INR)\b', full) and re.search(r'\b(EUR|USD|GBP|AED|INR)\b', full).group(1) or ""
 
-    # ── LUT / Bond ──
-    # Invoice has: "E/GST/043/26-27" (same as invoice no for GST export)
-    # Checklist: LUT info in marks: "LUTNO.AD2403260563860DT:28.03.2026"
-    fields["LUT / Bond"] = fr([
-        r"\b(E/LUT/[0-9]+/[0-9\-]+)\b",
-        r"LUT\s*(?:No\.?|NUMBER)?[\s:\-]*([A-Z0-9/\-]{4,30})",
-        r"LUTNO\.([A-Z0-9]+)",
-    ])
+    # 20. Total Invoice Value — last number on Amount Chargeable line y≈693
+    total_t = wt(words, 690, 700)
+    nums = re.findall(r'([0-9,]+\.[0-9]{2})', total_t)
+    f["Total Invoice Value"] = nums[-1].replace(",", "") if nums else ""
 
-    # ── DBK ──
-    # Seen: "DBK Sr. no. 9021/B" and "Shipment Under Duty Drawback No. 9021/B"
-    fields["DBK / Drawback"] = fr([
-        r"Duty\s+Drawback\s+No\.?[\s:\-]*([A-Z0-9/\-]{2,20})",
-        r"DBK\s+(?:Sr\.?\s*[Nn]o\.?|Declaration|Sl\s*No)[\s:\-]*([A-Z0-9/\-]{2,20})",
-        r"(?:DBK|Drawback)[\s:\-]+([A-Z0-9/\-]{2,15})",
-        r"9021/?[A-Z]\b",
-    ])
-    if not fields["DBK / Drawback"]:
+    # FOB Value — "Before Tax Value (Rs.) NNN" if present
+    m = re.search(r'Before\s+Tax\s+Value\s*\([A-Z]+\.?\)\s*([0-9,]+\.?[0-9]{0,2})', full)
+    f["FOB Value"] = m.group(1).replace(",", "") if m else ""
+
+    # 22. Gross Weight — not on invoice
+    f["Gross Weight"] = ""
+    # 23. Net Weight — not on invoice
+    f["Net Weight"] = ""
+
+    # 24. No. of Packages  y≈369  x 0-200
+    pkg_t = wt(words, 366, 376, 0, 200)
+    m = re.search(r'(\d+)', pkg_t)
+    f["No. of Packages"] = m.group(1) if m else ""
+
+    # 25. Product  y≈378  x 130-390
+    f["Product"] = wt(words, 375, 386, 130, 390)
+
+    # 26. Model No  y≈390  x 155+
+    model_t = wt(words, 387, 398, 155, 600)
+    f["Model No"] = model_t.strip()
+
+    # 27. HSN Code  y≈402  x 175+  "9021 3900" → strip space
+    hsn_t = wt(words, 399, 410, 175, 600)
+    m = re.search(r'([0-9]{4}\s*[0-9]{4}|[0-9]{8})', hsn_t)
+    f["HSN Code"] = m.group(1).replace(" ", "") if m else ""
+
+    # 28. LUT / Bond — if invoice number contains LUT
+    f["LUT / Bond"] = f["Invoice No"] if "LUT" in f.get("Invoice No", "").upper() else ""
+
+    # 29. DBK / Advance  y≈438
+    dbk_t = wt(words, 435, 446)
+    m = re.search(r'DBK\s+Sr\.?\s*No\.?\s*([A-Z0-9/]+)', dbk_t, re.IGNORECASE)
+    if not m:
         m = re.search(r'\b(9021/?[A-Z])\b', full)
-        if m:
-            fields["DBK / Drawback"] = m.group(1)
+    f["DBK / Advance"] = m.group(1) if m else ""
 
-    # ── RoDTEP ──
-    # Checklist: "RODTEP Amount(INR) 2704.74"
-    fields["RoDTEP"] = fr([
-        r"RODTEP\s+Amount[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"RoDTEP[\s:\-]*(?:Amount)?[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
-    ])
+    # 30. RoDTEP
+    f["RoDTEP"] = "Claimed" if re.search(r'RoDTEP', full, re.IGNORECASE) else ""
 
-    # ── IGST ──
-    # Checklist: "IGST Amount(INR) 34697.80"
-    fields["IGST Refund"] = fr([
-        r"IGST\s+Amount[\s(INR):\-]*([0-9,]+\.?[0-9]{0,2})",
-        r"IGST[\s(INR):\-]+([0-9,]+\.?[0-9]{0,2})",
-        r"Add\s*:\s*IGST\s*\([A-Z]+\.?\)[\s:\-]*([0-9,]+\.?[0-9]{0,2})",
-    ])
+    return f
 
-    # ── HSN Code ──
-    # Invoice: "H.S.CODE : 9021 3900"  (with space in middle)
-    # Checklist: "90213900" (RITC column)
-    fields["HSN Code"] = fr([
-        r"H\.?S\.?(?:N\.?)?\s*CODE[\s:\-]*([0-9]{4}\s*[0-9]{4})",
-        r"H\.?S\.?(?:N\.?)?\s*CODE[\s:\-]*([0-9]{4,8})",
-        r"\bRITC\b[\s\S]{0,30}?([0-9]{8})\b",
-        r"\b(9021\s*3900)\b",
-        r"\b(90213900)\b",
-    ])
-    # Clean space from HSN like "9021 3900" → "90213900"
-    if fields["HSN Code"]:
-        fields["HSN Code"] = fields["HSN Code"].replace(" ", "")
 
-    # ── Bank A/C No ──
-    # Invoice/PL: "A/C - 01020107664"
-    # Checklist: "Forex Bank A/c No" followed by number, or "BankA/cNo 0036683667"
-    fields["Bank A/C No"] = fr([
-        r"A/C\s*[-–]\s*([0-9]{9,18})\b",
-        r"(?:Bank\s*)?A/?[Cc]\s*(?:No\.?|Number)?[\s:\-]+([0-9]{9,18})\b",
-        r"BankA/cNo\s*([0-9]{9,18})\b",
-        r"Forex\s+Bank\s+A/c\s+No[\s\S]{0,20}?([0-9]{9,18})\b",
-        r"Account\s*(?:No\.?|Number)[\s:\-]*([0-9]{9,18})\b",
-    ])
+# ─────────────────────────────────────────────────────────────────────
+# PACKING LIST EXTRACTOR
+# Same layout as invoice; add gross/net weight from totals row
+# ─────────────────────────────────────────────────────────────────────
 
-    return {k: v.strip() if v else "" for k, v in fields.items()}
+def extract_packing(words):
+    f = extract_invoice(words)  # reuse — same header layout
+    full = " ".join(w["text"] for w in words)
 
+    # Gross/Net from "Total 465 4.50 6.00"
+    m = re.search(r'Total\s+[0-9]+\s+([0-9]+\.[0-9]{2,3})\s+([0-9]+\.[0-9]{2,3})', full)
+    if m:
+        f["Net Weight"]   = m.group(1)
+        f["Gross Weight"] = m.group(2)
+
+    m2 = re.search(r'Total\s+Cartons?\s*:\s*0*([0-9]+)', full, re.IGNORECASE)
+    if m2:
+        f["No. of Packages"] = m2.group(1)
+
+    # No monetary values on packing list
+    f["FOB Value"]          = ""
+    f["Total Invoice Value"] = ""
+    return f
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CHECKLIST EXTRACTOR
+# Verified coordinates from 3234316761-OMNI__2_.PDF (595×842 pt)
+# Left labels  x0  18-120   Left values x0  128-310
+# Right labels x0 314-425   Right values x0 428-560
+# ─────────────────────────────────────────────────────────────────────
+
+def extract_checklist(words):
+    full = " ".join(w["text"] for w in words)
+    f = {}
+
+    def lv(y1, y2, x1=128, x2=314):
+        return wt(words, y1, y2, x1, x2)
+
+    def rv(y1, y2, x1=428, x2=580):
+        return wt(words, y1, y2, x1, x2)
+
+    # 1. Exporter Name  y≈132  x 18-200
+    f["Exporter Name"] = wt(words, 129, 139, 18, 200)
+
+    # 2. IEC  y≈108  x 18-120  (first token = 10-digit number)
+    iec_t = wt(words, 105, 115, 18, 122)
+    m = re.search(r'([0-9]{10})', iec_t)
+    f["IEC"] = m.group(1) if m else ""
+
+    # 3. GSTIN  y≈108  x 148-314
+    gstin_t = wt(words, 105, 115, 148, 314)
+    m = re.search(r'([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z])', gstin_t)
+    f["GSTIN"] = m.group(1) if m else ""
+
+    # 4. PAN  y≈120  x 45-120
+    pan_t = wt(words, 117, 128, 45, 122)
+    m = re.search(r'([A-Z]{5}[0-9]{4}[A-Z])', pan_t)
+    f["PAN"] = m.group(1) if m else ""
+
+    # 5. AD Code  y≈288  x 120-200
+    ad_t = lv(285, 296, 120, 200)
+    m = re.search(r'([0-9]{7})', ad_t)
+    f["AD Code"] = m.group(1) if m else ""
+
+    # 6. Bank A/C No — "Forex Bank A/c No" label at y≈300; value usually blank on this form
+    bank_t = lv(297, 310, 18, 314)
+    m = re.search(r'([0-9]{9,18})', bank_t)
+    f["Bank A/C No"] = m.group(1) if m else ""
+
+    # 7. Invoice No  y≈370  x 128-314
+    inv_raw = lv(366, 378)
+    m = re.search(r'(E/(?:LUT|GST)/[0-9]+/[0-9\-]+)', inv_raw, re.IGNORECASE)
+    f["Invoice No"] = m.group(1) if m else inv_raw
+
+    # 8. Invoice Date  y≈381  x 128-314
+    date_raw = lv(377, 390)
+    m = re.search(r'(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4}|\d{2}-[A-Za-z]+-\d{4})', date_raw)
+    f["Invoice Date"] = m.group(1) if m else date_raw
+
+    # 9. Buyer / Consignee  y≈108  x 314+
+    f["Buyer / Consignee"] = wt(words, 105, 115, 314, 600)
+
+    # 10. Buyer PO No — not on checklist
+    f["Buyer PO No"] = ""
+
+    # 11. Country of Origin — not on page 1 checklist
+    f["Country of Origin"] = ""
+
+    # 12. Country of Destination  y≈231  x 128-314  "Italy"
+    f["Country of Destination"] = lv(228, 238)
+
+    # 13. Port of Loading  y≈184  x 128-314  "Ahmedabad Air Cargo(INAMD4)"
+    f["Port of Loading"] = lv(181, 192)
+
+    # 14. Port of Discharge  y≈195  x 128-314  "Milano(ITMIL)"
+    f["Port of Discharge"] = lv(192, 203)
+
+    # 15. Delivery Terms (Incoterm)  y≈393  x 128-314  "CIF"
+    inco_raw = lv(390, 403)
+    m = re.search(r'\b(FOB|CIF|CFR|EXW|DAP|DDP|FCA|CPT|CIP|DAT|FAS|DPU)\b', inco_raw, re.IGNORECASE)
+    f["Delivery Terms (Incoterm)"] = m.group(1).upper() if m else inco_raw
+
+    # 16. Payment Terms  y≈510  x 128-200  "DA"
+    f["Payment Terms"] = wt(words, 507, 519, 128, 200)
+
+    # 17. Payment Days  y≈510  x 410+  "180 days" → extract number
+    days_t = wt(words, 507, 519, 410, 600)
+    m = re.search(r'(\d+)', days_t)
+    f["Payment Days"] = m.group(1) if m else days_t
+
+    # 18. Marks & Nos  y≈522  x 128-314
+    f["Marks & Nos"] = lv(519, 533)
+
+    # 19. Currency  y≈417  x 75-130  "EUR"
+    curr_t = wt(words, 414, 424, 75, 132)
+    m = re.search(r'\b(EUR|USD|GBP|AED|INR|JPY)\b', curr_t)
+    f["Currency"] = m.group(1) if m else ""
+
+    # 20. Total Invoice Value  y≈369  x 428+  "EUR 6352.00 (INR ...)"
+    inv_val_raw = rv(366, 379)
+    m = re.search(r'(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.[0-9]{2})', inv_val_raw)
+    f["Total Invoice Value"] = m.group(1).replace(",", "") if m else ""
+
+    # 21. FOB Value  y≈380  x 428+
+    fob_raw = rv(377, 392)
+    m = re.search(r'(?:EUR|USD|GBP|INR|AED)\s*([0-9,]+\.[0-9]{2})', fob_raw)
+    f["FOB Value"] = m.group(1).replace(",", "") if m else ""
+
+    # 22. Gross Weight  y≈231  x 428+  "6.000 KGS"
+    gross_raw = rv(228, 240)
+    m = re.search(r'([0-9,]+\.[0-9]{3})', gross_raw)
+    f["Gross Weight"] = m.group(1) if m else ""
+
+    # 23. Net Weight  y≈242  x 428+  "4.500 KGS"
+    net_raw = rv(239, 250)
+    m = re.search(r'([0-9,]+\.[0-9]{3})', net_raw)
+    f["Net Weight"] = m.group(1) if m else ""
+
+    # 24. No. of Packages  y≈195  x 428+  "1 CTN"
+    pkg_raw = rv(192, 203)
+    m = re.search(r'([0-9]+)', pkg_raw)
+    f["No. of Packages"] = m.group(1) if m else ""
+
+    # 25. Product  y≈744  x 148+
+    f["Product"] = wt(words, 741, 753, 148, 600)
+
+    # 26. Model No — embedded in product desc on checklist
+    m = re.search(r'MODEL\s+([A-Z0-9()* ]{4,30}?)\s+(?:PACKING|$)', f["Product"], re.IGNORECASE)
+    f["Model No"] = m.group(1).strip() if m else ""
+
+    # 27. HSN Code  y≈744  x 68-148  "90213900"
+    hsn_t = wt(words, 741, 753, 68, 148)
+    m = re.search(r'([0-9]{8})', hsn_t)
+    f["HSN Code"] = m.group(1) if m else ""
+
+    # 28. LUT / Bond
+    m = re.search(r'(E/LUT/[0-9]+/[0-9\-]+)', full, re.IGNORECASE)
+    f["LUT / Bond"] = m.group(1) if m else ""
+
+    # 29. DBK / Advance
+    m = re.search(r'\b(9021/?[A-Z])\b', full)
+    f["DBK / Advance"] = m.group(1) if m else ""
+
+    # 30. RoDTEP amount  y≈336  x 428+
+    rodtep_raw = rv(333, 345)
+    m = re.search(r'([0-9,]+\.[0-9]{2})', rodtep_raw)
+    f["RoDTEP"] = m.group(1) if m else ""
+
+    return f
+
+
+def extract_fields(words):
+    doc_type = detect_doc_type(words)
+    if doc_type == "checklist":
+        return extract_checklist(words), doc_type
+    elif doc_type == "packing":
+        return extract_packing(words), doc_type
+    else:
+        return extract_invoice(words), doc_type
+
+
+# ─────────────────────────────────────────────────────────────────────
+# COMPARISON
+# ─────────────────────────────────────────────────────────────────────
 
 CRITICAL_FIELDS = {
     "IEC", "GSTIN", "Invoice No", "Invoice Date",
@@ -416,32 +432,42 @@ CRITICAL_FIELDS = {
 }
 
 def normalise(val):
-    return re.sub(r"[\s,./\-()]", "", val).upper()
+    v = re.sub(r'[\s,./\-()]', '', str(val)).upper()
+    v = re.sub(r'(KGS?|MT|LBS?)$', '', v)
+    return v
 
-def compare(inv_val, pack_val, chk_val):
-    vals = [normalise(v) for v in (inv_val, pack_val, chk_val) if v]
+def compare(i, p, c):
+    vals = [normalise(v) for v in (i, p, c) if v and v not in ("—", "")]
     if not vals:
         return "❌ Missing"
     if len(set(vals)) == 1:
         return "✅ Match"
     return "⚠️ Mismatch"
 
-def build_comparison_table(inv, pack, chk):
+FIELD_ORDER = [
+    "Exporter Name", "IEC", "GSTIN", "PAN", "AD Code", "Bank A/C No",
+    "Invoice No", "Invoice Date", "Buyer / Consignee", "Buyer PO No",
+    "Country of Origin", "Country of Destination",
+    "Port of Loading", "Port of Discharge",
+    "Delivery Terms (Incoterm)", "Payment Terms", "Payment Days",
+    "Marks & Nos", "Currency", "Total Invoice Value", "FOB Value",
+    "Gross Weight", "Net Weight", "No. of Packages",
+    "Product", "Model No", "HSN Code",
+    "LUT / Bond", "DBK / Advance", "RoDTEP",
+]
+
+def build_table(inv, pack, chk):
     rows = []
-    for field in inv.keys():
+    for field in FIELD_ORDER:
         i = inv.get(field, "")
         p = pack.get(field, "")
         c = chk.get(field, "")
-        status = compare(i, p, c)
-        rows.append({
-            "Field": field,
-            "Invoice": i or "—",
-            "Packing List": p or "—",
-            "Checklist": c or "—",
-            "Status": status,
-        })
+        rows.append({"Field": field,
+                     "Invoice":      i or "—",
+                     "Packing List": p or "—",
+                     "Checklist":    c or "—",
+                     "Status":       compare(i, p, c)})
     return pd.DataFrame(rows)
-
 
 STATUS_COLOR = {
     "✅ Match":    "background-color:#D5F5E3;color:#1E8449",
@@ -450,20 +476,18 @@ STATUS_COLOR = {
 }
 
 def style_row(row):
-    style = STATUS_COLOR.get(row["Status"], "")
-    return [""] * (len(row) - 1) + [style]
+    return [""] * (len(row) - 1) + [STATUS_COLOR.get(row["Status"], "")]
 
 SECTIONS = {
-    "🏭 Exporter & Registration": ["Exporter Name", "IEC", "GSTIN", "PAN", "AD Code", "Bank A/C No"],
-    "📄 Invoice Reference":       ["Invoice No", "Invoice Date", "Buyer / Consignee", "Buyer PO No"],
-    "🚢 Shipment Details":        ["Country of Origin", "Country of Destination",
-                                   "Port of Loading", "Port of Discharge",
-                                   "Delivery Terms (Incoterm)", "Payment Terms",
-                                   "Mode of Transport", "Marks & Nos"],
-    "💰 Financial Details":       ["Currency", "Total Invoice Value", "FOB Value",
-                                   "Gross Weight", "Net Weight", "No. of Packages",
-                                   "HSN Code"],
-    "📋 Export Scheme / Duty":    ["LUT / Bond", "DBK / Drawback", "RoDTEP", "IGST Refund"],
+    "🏭 Exporter & Registration": ["Exporter Name","IEC","GSTIN","PAN","AD Code","Bank A/C No"],
+    "📄 Invoice Reference":       ["Invoice No","Invoice Date","Buyer / Consignee","Buyer PO No"],
+    "🚢 Shipment Details":        ["Country of Origin","Country of Destination",
+                                   "Port of Loading","Port of Discharge",
+                                   "Delivery Terms (Incoterm)","Payment Terms","Payment Days","Marks & Nos"],
+    "💰 Financial Details":       ["Currency","Total Invoice Value","FOB Value",
+                                   "Gross Weight","Net Weight","No. of Packages"],
+    "📦 Product Details":         ["Product","Model No","HSN Code"],
+    "📋 Export Scheme / Duty":    ["LUT / Bond","DBK / Advance","RoDTEP"],
 }
 
 def render_section(title, fields, df):
@@ -471,28 +495,27 @@ def render_section(title, fields, df):
     if subset.empty:
         return
     st.markdown(f'<div class="section-head">{title}</div>', unsafe_allow_html=True)
-    st.dataframe(
-        subset.style.apply(style_row, axis=1),
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.dataframe(subset.style.apply(style_row, axis=1),
+                 use_container_width=True, hide_index=True)
     st.markdown("<br>", unsafe_allow_html=True)
 
 
-# ── APP ──
+# ─────────────────────────────────────────────────────────────────────
+# APP UI
+# ─────────────────────────────────────────────────────────────────────
 
 st.markdown("""
 <div class="app-header">
   <h1>🚢 Export Checklist Verifier</h1>
-  <p>Compare Invoice · Packing List · Export Checklist — field by field</p>
+  <p>Compare Invoice · Packing List · Export Checklist — coordinate-based extraction</p>
 </div>
 """, unsafe_allow_html=True)
 
 col1, col2, col3 = st.columns(3)
 with col1:
-    inv_file  = st.file_uploader("📄 Commercial Invoice (PDF)", type="pdf", key="inv")
+    inv_file  = st.file_uploader("📄 Commercial Invoice (PDF)",    type="pdf", key="inv")
 with col2:
-    pack_file = st.file_uploader("📦 Packing List (PDF)", type="pdf", key="pack")
+    pack_file = st.file_uploader("📦 Packing List (PDF)",          type="pdf", key="pack")
 with col3:
     chk_file  = st.file_uploader("✅ Export Checklist / SB (PDF)", type="pdf", key="chk")
 
@@ -502,21 +525,22 @@ if not any([inv_file, pack_file, chk_file]):
     st.info("Upload at least one document above to begin verification.")
     st.stop()
 
-with st.spinner("Reading documents…"):
-    inv_text  = extract_text(inv_file)  if inv_file  else ""
-    pack_text = extract_text(pack_file) if pack_file else ""
-    chk_text  = extract_text(chk_file)  if chk_file  else ""
+with st.spinner("Extracting fields using coordinate-based parsing…"):
+    inv_words  = get_words(inv_file)  if inv_file  else []
+    pack_words = get_words(pack_file) if pack_file else []
+    chk_words  = get_words(chk_file)  if chk_file  else []
 
-    inv_data  = extract_fields(inv_text)
-    pack_data = extract_fields(pack_text)
-    chk_data  = extract_fields(chk_text)
+    inv_data,  inv_type  = extract_fields(inv_words)  if inv_words  else ({}, "invoice")
+    pack_data, pack_type = extract_fields(pack_words) if pack_words else ({}, "packing")
+    chk_data,  chk_type  = extract_fields(chk_words)  if chk_words  else ({}, "checklist")
 
-    df = build_comparison_table(inv_data, pack_data, chk_data)
+    df = build_table(inv_data, pack_data, chk_data)
 
 matched  = (df["Status"] == "✅ Match").sum()
 mismatch = (df["Status"] == "⚠️ Mismatch").sum()
 missing  = (df["Status"] == "❌ Missing").sum()
 total    = len(df)
+pct      = int(matched / total * 100) if total else 0
 
 t1, t2, t3, t4 = st.columns(4)
 with t1:
@@ -526,42 +550,37 @@ with t2:
 with t3:
     st.markdown(f'<div class="tile tile-missing"><h2>{missing}</h2><p>❌ Missing</p></div>', unsafe_allow_html=True)
 with t4:
-    pct = int(matched / total * 100) if total else 0
     st.metric("Completeness", f"{pct}%", delta=f"{total} fields checked")
 
 st.markdown("---")
 
-critical_issues = df[
-    (df["Field"].isin(CRITICAL_FIELDS)) &
-    (df["Status"] != "✅ Match")
-]
-if not critical_issues.empty:
-    lines_html = ""
-    for _, row in critical_issues.iterrows():
+crit = df[(df["Field"].isin(CRITICAL_FIELDS)) & (df["Status"] != "✅ Match")]
+if not crit.empty:
+    html = ""
+    for _, row in crit.iterrows():
         icon = "⚠️" if row["Status"] == "⚠️ Mismatch" else "❌"
-        lines_html += f'<div class="critical-item">{icon} <b>{row["Field"]}</b> — {row["Status"]}'
+        html += f'<div class="critical-item">{icon} <b>{row["Field"]}</b> — {row["Status"]}'
         if row["Status"] == "⚠️ Mismatch":
-            lines_html += (f' &nbsp;|&nbsp; Invoice: <code>{row["Invoice"]}</code>'
-                           f' Packing: <code>{row["Packing List"]}</code>'
-                           f' Checklist: <code>{row["Checklist"]}</code>')
-        lines_html += '</div>'
-    st.markdown(f"""
-    <div class="critical-box">
-        <h4>🚨 Critical Issues — Resolve before export clearance</h4>
-        {lines_html}
-    </div>
-    """, unsafe_allow_html=True)
+            html += (f' &nbsp;|&nbsp; Invoice: <code>{row["Invoice"]}</code>'
+                     f'  Packing: <code>{row["Packing List"]}</code>'
+                     f'  Checklist: <code>{row["Checklist"]}</code>')
+        html += '</div>'
+    st.markdown(
+        f'<div class="critical-box"><h4>🚨 Critical Issues — Resolve before export clearance</h4>{html}</div>',
+        unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
 else:
     st.success("🎉 No critical issues found. All mandatory fields match.")
 
-for section_title, field_list in SECTIONS.items():
-    render_section(section_title, field_list, df)
+for sec_title, sec_fields in SECTIONS.items():
+    render_section(sec_title, sec_fields, df)
 
-with st.expander("🔍 View extracted raw text (debug)"):
+with st.expander("🔍 Debug — raw text & detected doc types"):
+    st.caption(f"Invoice: **{inv_type}** | Packing: **{pack_type}** | Checklist: **{chk_type}**")
     tabs = st.tabs(["Invoice", "Packing List", "Checklist"])
-    for tab, txt in zip(tabs, [inv_text, pack_text, chk_text]):
+    for tab, fobj in zip(tabs, [inv_file, pack_file, chk_file]):
         with tab:
+            txt = get_raw_text(fobj) if fobj else ""
             if txt:
                 st.markdown(f'<div class="raw-text">{txt[:5000]}</div>', unsafe_allow_html=True)
             else:
@@ -569,9 +588,5 @@ with st.expander("🔍 View extracted raw text (debug)"):
 
 st.markdown("---")
 csv_data = df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="⬇️ Download Full Report (CSV)",
-    data=csv_data,
-    file_name="export_verification_report.csv",
-    mime="text/csv",
-)
+st.download_button("⬇️ Download Full Report (CSV)", csv_data,
+                   "export_verification_report.csv", "text/csv")
